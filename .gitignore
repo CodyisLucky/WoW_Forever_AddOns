@@ -1,0 +1,16 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# WoW per-account/character saved data
+WTF/
+SavedVariables/
+*.bak
+*.old
+
+# Packaging output
+*.zip
+.release/
