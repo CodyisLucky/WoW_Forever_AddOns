@@ -1,0 +1,12 @@
+## Interface: 16001
+## Title: Forever Ground Markers
+## Notes: Save persistent markers at your current location.
+## Author: Cody
+## Version: 0.1.0
+## Category: Map
+## IconTexture: Interface\Icons\INV_Misc_Map_01
+## SavedVariables: ForeverGroundMarkersDB
+
+ForeverGroundMarkers.lua
+Position.lua
+Markers.lua
