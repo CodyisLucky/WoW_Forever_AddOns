@@ -476,10 +476,10 @@ Agents can't run the client. End every change with explicit test steps, for exam
 
 ## 6. Install locally for testing
 
-The client reads from the Forever AddOns folder (beta: `World of Warcraft/_classic_beta_/Interface/AddOns/`; confirm the folder name after the Nov 4 launch). From WSL, copy rather than symlink, since the Windows client doesn't follow WSL symlinks reliably:
+The client reads from the Forever AddOns folder, `World of Warcraft/_forever_/Interface/AddOns/`. From WSL, copy rather than symlink, since the Windows client doesn't follow WSL symlinks reliably:
 
 ```bash
-WOW_ADDONS="/mnt/c/Program Files (x86)/World of Warcraft/_classic_beta_/Interface/AddOns"
+WOW_ADDONS="/mnt/c/Program Files (x86)/World of Warcraft/_forever_/Interface/AddOns"
 rsync -a --delete --exclude '.git' MyAddon/ "$WOW_ADDONS/MyAddon/"
 ```
 

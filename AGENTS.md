@@ -21,7 +21,7 @@ Every addon in this repo targets **World of Warcraft: Forever only**.
 | Game version | 1.60.1 |
 | TOC `## Interface:` | `16001` |
 | Client UI engine | Modern Mainline (12.x-era) API, same addon rules as Midnight |
-| Beta AddOns folder | `World of Warcraft/_classic_beta_/Interface/AddOns/` (launch folder not yet confirmed) |
+| AddOns folder | `World of Warcraft/_forever_/Interface/AddOns/` |
 
 Do **not** add support for, or code paths targeting, any other flavor:
 

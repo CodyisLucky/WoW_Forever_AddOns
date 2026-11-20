@@ -88,6 +88,28 @@ function ns.RemoveMarker(id)
     return true
 end
 
+--- Finds the saved marker closest to a position, within a maximum distance.
+--- Only markers on the same continent (instanceId) are considered, since world
+--- coordinates from different continents can't be compared. Uses pairs because
+--- removed markers leave gaps in the table.
+---@param position table A position from ns.GetPlayerPosition
+---@param maxRange number Maximum distance in yards
+---@return number|nil id The nearest marker's ID, or nil if none is in range
+---@return table|nil marker The nearest marker
+---@return number|nil distance Its distance in yards
+function ns.FindNearestMarker(position, maxRange)
+    local nearestId, nearestMarker, nearestDistance
+    for id, marker in pairs(ns.db.markers) do
+        if marker.instanceId == position.instanceId then
+            local distance = ns.GetDistance(position.worldX, position.worldY, marker.worldX, marker.worldY)
+            if distance <= maxRange and (not nearestDistance or distance < nearestDistance) then
+                nearestId, nearestMarker, nearestDistance = id, marker, distance
+            end
+        end
+    end
+    return nearestId, nearestMarker, nearestDistance
+end
+
 --- Handles /fgm mark: saves the player's current position as a new marker and
 --- prints it. When position isn't available, prints why and saves nothing. In
 --- debug mode it also logs the failure's reason code, or the raw saved values on success.

@@ -10,12 +10,35 @@ read_globals = {
     -- Frames and chat
     "CreateFrame",
     "DEFAULT_CHAT_FRAME",
+    "GameTooltip",
+    "UIParent",
+    "UISpecialFrames",
+
+    -- Scroll lists
+    "CreateDataProvider",
+    "CreateScrollBoxListLinearView",
+    "ScrollBoxConstants",
+    "ScrollUtil",
+
+    -- Money and number formatting
+    "BreakUpLargeNumbers",
+    "GetMoneyString",
 
     -- Namespaced APIs
     "C_AddOns",
+    "C_AuctionHouse",
+    "C_Item",
     "C_Map",
+    "C_Navigation",
+    "C_SuperTrack",
     "C_Timer",
     "Settings",
+
+    -- Blizzard UI objects and mixins
+    "Enum",
+    "Item",
+    "MinimalSliderWithSteppersMixin",
+    "UiMapPoint",
 
     -- Unit and zone
     "GetSubZoneText",
@@ -24,7 +47,15 @@ read_globals = {
     "IsInInstance",
     "UnitPosition",
 
+    -- Realm and client
+    "GetBuildInfo",
+    "GetRealmName",
+
     -- WoW Lua extensions
+    "date",
+    "debugprofilestop",
+    "debugstack",
+    "geterrorhandler",
     "strtrim",
     "time",
 }
@@ -33,6 +64,15 @@ files["ForeverGroundMarkers/"] = {
     globals = {
         "ForeverGroundMarkersDB",
         "SLASH_FOREVERGROUNDMARKERS1",
+        "SlashCmdList",
+    },
+}
+
+files["ForeverVendorSnipe/"] = {
+    globals = {
+        "ForeverVendorSnipeDB",
+        "ForeverVendorSnipeLog",
+        "SLASH_FOREVERVENDORSNIPE1",
         "SlashCmdList",
     },
 }

@@ -11,6 +11,18 @@ local CHAT_PREFIX_COLOR = "|cff33ff99"
 local SLASH_COMMAND = "/fgm"
 local DEFAULT_COMMAND = "help"
 
+-- How the in-world marker shares the game's single tracked destination with
+-- quests and the player's own map pin. Chosen in the settings panel (Config.lua)
+-- and applied by Beacon.lua.
+ns.TRACKING_MODES = {
+    -- Show the marker only while nothing else is being tracked.
+    YIELD = "yield",
+    -- Take over tracking while a marker is shown, restore it afterwards.
+    RESTORE = "restore",
+    -- Show only after /fgm show, until /fgm hide. Restores afterwards.
+    MANUAL = "manual",
+}
+
 -- Account-wide defaults, merged into ForeverGroundMarkersDB on load.
 -- markers is keyed by marker ID. nextMarkerId only ever increases, so an ID
 -- is never reused after its marker is removed.
@@ -18,6 +30,10 @@ ns.defaults = {
     nextMarkerId = 1,
     markers = {},
     debug = false,
+    trackingMode = ns.TRACKING_MODES.YIELD,
+    maxRange = 100,          -- yards
+    showOffscreen = true,    -- keep the marker at the screen edge when off-screen
+    manualShown = false,     -- MANUAL mode only: whether /fgm show is active
 }
 
 ns.SLASH_COMMAND = SLASH_COMMAND
@@ -60,50 +76,84 @@ function ns.Debug(msg)
 end
 
 local eventFrame = CreateFrame("Frame")
+
+-- Handlers per event, in registration order: eventHandlers[event] = { handler1, handler2 }.
+-- Lists are never modified in place. ns.UnregisterEvent builds a new list, so a
+-- handler that unregisters itself mid-dispatch can't make the loop skip the next one.
 local eventHandlers = {}
 
---- Routes a game event to the handler registered for it.
---- Installed as the event frame's OnEvent script. Events with no handler are ignored.
+--- Routes a game event to every handler registered for it, in registration order.
+--- Installed as the event frame's OnEvent script. Events with no handlers are ignored.
 ---@param event string The game event name
----@param ... any The event's payload, passed straight through to the handler
+---@param ... any The event's payload, passed straight through to each handler
 local function dispatchEvent(_, event, ...)
-    local handler = eventHandlers[event]
-    if handler then
+    local handlers = eventHandlers[event]
+    if not handlers then
+        return
+    end
+    for _, handler in ipairs(handlers) do
         handler(...)
     end
 end
 eventFrame:SetScript("OnEvent", dispatchEvent)
 
---- Registers a handler for a game event on the addon's shared event frame.
---- One handler per event. Registering again replaces the previous handler.
+--- Adds a handler for a game event on the addon's shared event frame.
+--- Several files can listen to the same event, and each handler runs in the order it
+--- was registered. The game is only asked to send the event once, on the first registration.
 ---@param event string The game event name, e.g. "PLAYER_LOGIN"
 ---@param handler fun(...) Called with the event's payload
 function ns.RegisterEvent(event, handler)
-    eventHandlers[event] = handler
-    eventFrame:RegisterEvent(event)
+    local handlers = eventHandlers[event]
+    if not handlers then
+        handlers = {}
+        eventHandlers[event] = handlers
+        eventFrame:RegisterEvent(event)
+    end
+    handlers[#handlers + 1] = handler
 end
 
---- Stops listening for a game event and removes its handler.
+--- Removes one handler from a game event, leaving any other handlers in place.
+--- Builds a new list without the handler instead of editing the old one (see eventHandlers).
+--- When no handlers remain, the game stops sending the event.
 ---@param event string The game event name
-function ns.UnregisterEvent(event)
-    eventHandlers[event] = nil
-    eventFrame:UnregisterEvent(event)
+---@param handler fun(...) The same function that was passed to ns.RegisterEvent
+function ns.UnregisterEvent(event, handler)
+    local handlers = eventHandlers[event]
+    if not handlers then
+        return
+    end
+
+    local remaining = {}
+    for _, existing in ipairs(handlers) do
+        if existing ~= handler then
+            remaining[#remaining + 1] = existing
+        end
+    end
+
+    if #remaining == 0 then
+        eventHandlers[event] = nil
+        eventFrame:UnregisterEvent(event)
+    else
+        eventHandlers[event] = remaining
+    end
 end
 
---- Initializes SavedVariables once this addon has loaded.
+--- Initializes SavedVariables once this addon has loaded, then builds the settings panel.
 --- ADDON_LOADED fires for every addon, so this ignores the others, then unregisters
---- itself. Creates the saved table on first run, merges defaults, and exposes it
---- as ns.db for the other files.
+--- itself. Creates the saved table on first run, merges defaults, exposes it as
+--- ns.db for the other files, and calls ns.InitSettings (Config.lua), which needs ns.db.
 ---@param loadedName string Name of the addon that just loaded
 local function onAddonLoaded(loadedName)
     if loadedName ~= addonName then
         return
     end
-    ns.UnregisterEvent("ADDON_LOADED")
+    ns.UnregisterEvent("ADDON_LOADED", onAddonLoaded)
 
     ForeverGroundMarkersDB = ForeverGroundMarkersDB or {}
     applyDefaults(ForeverGroundMarkersDB, ns.defaults)
     ns.db = ForeverGroundMarkersDB
+
+    ns.InitSettings()
 end
 
 --- Announces the loaded version in chat once the player is in the world.

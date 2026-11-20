@@ -31,6 +31,19 @@ local function getDistinctSubZone(zoneName)
     return subZoneName
 end
 
+--- Returns the straight-line distance in yards between two world positions.
+--- Flat 2D distance, because UnitPosition gives addons no height. Only meaningful when
+--- both points share an instanceId (the same continent).
+---@param x1 number World X of the first point
+---@param y1 number World Y of the first point
+---@param x2 number World X of the second point
+---@param y2 number World Y of the second point
+---@return number distance Yards
+function ns.GetDistance(x1, y1, x2, y2)
+    local dx, dy = x2 - x1, y2 - y1
+    return math.sqrt(dx * dx + dy * dy)
+end
+
 --- Reads the player's position in both coordinate systems the addon stores.
 --- Map coordinates come from C_Map on the most specific map for the player's
 --- location (0-1 across that map). World coordinates come from UnitPosition in
