@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.1
+- Cheaper handling of repeat scan events. The game sends about 96,000 of them per full scan, and each is now dropped with one time comparison instead of a saved-data lookup.
+
 ## 0.3.0
 - Items bought in bulk on the Auction House (stackable items, bought by quantity) have their name shown in light blue. Items bought one listing at a time keep their quality color.
 - Results saved by 0.2.0 have no bulk information and show quality colors until the next scan.

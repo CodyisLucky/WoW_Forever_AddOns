@@ -4,7 +4,7 @@ Target: World of Warcraft: Forever (interface 16001). Not compatible with Retail
 
 Lists Auction House items whose buyout is below what a vendor pays for them, ranked by the profit you'd make buying them and selling them to a vendor.
 
-**Current status (0.3.0):** reads full Auction House scans (from Gathercraft, any other addon, or its own Scan button) and shows the below-vendor items in a movable window. List only: it doesn't buy anything.
+**Current status (0.3.1):** reads full Auction House scans (from Gathercraft, any other addon, or its own Scan button) and shows the below-vendor items in a movable window. List only: it doesn't buy anything.
 
 ## How it works
 
@@ -129,7 +129,7 @@ Reads full scans and builds the results. It owns all scan state, and the window 
 | `finishReading(scan)` | local | Saves the results, logs a summary, then waits for held items if any |
 | `readStep(scan)` | local | Reads auctions for up to 8 ms, counting bid-only and unreadable ones, then continues next frame |
 | `startReading(total)` | local | Creates the scan state and starts reading |
-| `onReplicateListUpdate()` | local | `REPLICATE_ITEM_LIST_UPDATE`: starts reading a scan from any addon, ignoring (and counting) repeat events |
+| `onReplicateListUpdate()` | local | `REPLICATE_ITEM_LIST_UPDATE`: starts reading a scan from any addon, ignoring (and counting) repeat events with a cheap time check first |
 | `onAuctionHouseShow()` / `onAuctionHouseClosed()` | local | Track and log whether the AH is open. Closing logs the ignored-event count and cancels a scan still being read |
 | `isAwaitingAnswer(realm)` | local | Whether this addon's scan request is still waiting for the server |
 | `ns.GetResults()` | public | `items, scannedAt, auctionCount` for this realm |
@@ -212,7 +212,7 @@ The example values are illustrative. Unit buyout and profit aren't saved. The wi
 
 ### Design decisions
 - **Listen instead of scan.** The 15-minute full-scan cooldown is shared by every addon, and Gathercraft already scans when the AH opens. `REPLICATE_ITEM_LIST_UPDATE` fires no matter which addon asked, so reading that scan costs nothing. The Scan button is only a fallback.
-- **Repeat events are ignored by time.** The game fires `REPLICATE_ITEM_LIST_UPDATE` 100+ times for one scan. Gathercraft's code shows the full list can be read on the first one. A real new scan can't arrive within 15 minutes, so events within 10 minutes of the last scan seen are treated as repeats. The timestamp is saved, so a `/reload` mid-scan doesn't read the same scan twice.
+- **Repeat events are ignored by time.** The game fires `REPLICATE_ITEM_LIST_UPDATE` many times for one scan. Gathercraft's code shows the full list can be read on the first one. A real new scan can't arrive within 15 minutes, so events within 10 minutes of the last scan seen are treated as repeats. The timestamp is saved, so a `/reload` mid-scan doesn't read the same scan twice. The log showed about 96,000 repeats per scan (roughly one per 2.5 auctions), so repeats are dropped by comparing `time()` with a local `ignoreEventsUntil` before any saved data is read.
 - **Reading in timed steps.** A scan can hold ~300,000 auctions (per Gathercraft's notes). Reading stops after 8 ms each frame and continues next frame, so the game doesn't freeze. Only below-vendor items are kept, which is a small set.
 - **Must read while the AH is open.** The scan list is gone once the AH closes, so closing mid-read cancels the scan and keeps the previous results. Item-data loading carries on after closing, since it doesn't need the AH.
 - **Uncached items are held, not dropped.** The vendor price comes from the item cache. Auctions for uncached items are held as `(count, buyout)` pairs. The item data is requested through Blizzard's `Item` mixin, and the auctions are checked when it arrives. Results are saved as soon as reading finishes, and held items join them as they load, for up to 60 seconds.

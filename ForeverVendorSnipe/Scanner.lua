@@ -64,6 +64,10 @@ local activeScan
 -- REPLICATE_ITEM_LIST_UPDATE events ignored since the Auction House opened. Logged on
 -- close, to check the assumption that one scan sends many repeat events.
 local ignoredEvents = 0
+-- time() until which REPLICATE_ITEM_LIST_UPDATE is a repeat of the last scan seen. A copy
+-- of lastScanSeenAt + DUPLICATE_EVENT_WINDOW, kept here so the ~96,000 repeat events per
+-- scan (measured in game) are dropped without looking up the saved data each time.
+local ignoreEventsUntil = 0
 
 --- Returns this realm's saved scan data, creating it on first use.
 --- Results are kept per realm because each realm has its own Auction House.
@@ -422,15 +426,23 @@ end
 --- Ignored while the Auction House is closed (the list can't be read), while a scan
 --- is being read, and for the repeat events of a scan already seen (see
 --- DUPLICATE_EVENT_WINDOW). Ignored events are counted for the log (ignoredEvents).
+--- Repeats are dropped by comparing time() with ignoreEventsUntil, before any saved
+--- data is touched. Only an event past that point reads the saved lastScanSeenAt, which
+--- also covers the first event after a /reload, when ignoreEventsUntil starts at 0.
 --- An empty list is ignored without marking the scan as seen, so a later event with
 --- the real list still gets through.
 local function onReplicateListUpdate()
     if not ahOpen then
         return
     end
-    local realm = getRealmData()
     local now = time()
-    if (activeScan and activeScan.state == STATES.READING) or now - realm.lastScanSeenAt < DUPLICATE_EVENT_WINDOW then
+    if now < ignoreEventsUntil or (activeScan and activeScan.state == STATES.READING) then
+        ignoredEvents = ignoredEvents + 1
+        return
+    end
+    local realm = getRealmData()
+    ignoreEventsUntil = realm.lastScanSeenAt + DUPLICATE_EVENT_WINDOW
+    if now < ignoreEventsUntil then
         ignoredEvents = ignoredEvents + 1
         return
     end
@@ -441,6 +453,7 @@ local function onReplicateListUpdate()
         return
     end
     realm.lastScanSeenAt = now
+    ignoreEventsUntil = now + DUPLICATE_EVENT_WINDOW
     startReading(total)
 end
 
