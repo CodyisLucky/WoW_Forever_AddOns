@@ -46,6 +46,8 @@ local ROW_HIGHLIGHT_TEXTURE = "Interface\\QuestFrame\\UI-QuestTitleHighlight"
 local STATUS_UPDATE_INTERVAL = 1 -- seconds, keeps "X min ago" and the cooldown current
 local REFRESH_DELAY = 0.2 -- seconds, batches many scan updates into one redraw
 local DEFAULT_QUALITY = Enum.ItemQuality.Common
+-- Name color for items bought in bulk (by quantity) instead of one listing at a time.
+local BULK_NAME_COLOR = { r = 0.4, g = 0.8, b = 1.0 } -- light blue, #66CCFF
 local SECONDS_PER_MINUTE = 60
 local SECONDS_PER_HOUR = 60 * 60
 local SECONDS_PER_DAY = 24 * 60 * 60
@@ -150,6 +152,7 @@ local function buildElements()
                 name = row.name,
                 sortName = sortName,
                 quality = row.quality,
+                bulk = row.bulk,
                 quantity = row.quantity,
                 unitBuyout = unitBuyout,
                 vendorPrice = row.vendorPrice,
@@ -260,8 +263,10 @@ local function createRowRegions(row)
     row:SetScript("OnLeave", hideTooltip)
 end
 
---- Fills a row with one list element: icon, name in its quality color, units at the
---- lowest price, and the three per-unit money columns.
+--- Fills a row with one list element: icon, name, units at the lowest price, and the
+--- three per-unit money columns. The name is light blue (BULK_NAME_COLOR) for items
+--- bought in bulk, otherwise its quality color. Rows saved before 0.3.0 have no bulk
+--- flag and keep the quality color until the next scan.
 --- The scroll box calls this whenever a row frame is shown for an element.
 ---@param row Button The row frame
 ---@param element table A list element from buildElements
@@ -272,7 +277,12 @@ local function initRow(row, element)
     row.itemID = element.itemID
     row.icon:SetTexture(C_Item.GetItemIconByID(element.itemID))
 
-    local r, g, b = C_Item.GetItemQualityColor(element.quality or DEFAULT_QUALITY)
+    local r, g, b
+    if element.bulk then
+        r, g, b = BULK_NAME_COLOR.r, BULK_NAME_COLOR.g, BULK_NAME_COLOR.b
+    else
+        r, g, b = C_Item.GetItemQualityColor(element.quality or DEFAULT_QUALITY)
+    end
     row.cells.name:SetText(element.name)
     row.cells.name:SetTextColor(r, g, b)
 

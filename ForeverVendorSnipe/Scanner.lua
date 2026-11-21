@@ -54,7 +54,8 @@ local ahOpen = false
 --   startedAt     time() when reading began, saved as the results' scan time
 --   items         results being built: items[itemID] = row (see addListing)
 --   vendorPrices  vendorPrices[itemID] = vendor price per unit, for items already looked up
---   names, qualities  the item's name and quality, cached in the same lookup as its price
+--   names, qualities, stackSizes  the item's name, quality and max stack size, cached in
+--                                 the same lookup as its price
 --   held          held[itemID] = { count, buyout, count, buyout, ... } for items not cached yet
 --   heldCount     number of item IDs in held
 --   readStartedMs, loadStartedMs  debugprofilestop() when reading / loading began, for the log
@@ -99,19 +100,31 @@ local function countKeys(t)
     return count
 end
 
---- Looks up an item's name, quality and vendor price from the game's item cache.
---- Returns nils when the item isn't cached yet.
+--- Looks up an item's name, quality, vendor price and max stack size from the game's
+--- item cache. Returns nils when the item isn't cached yet.
 ---@param itemID number
 ---@return string|nil name
 ---@return number|nil quality Enum.ItemQuality value
 ---@return number|nil sellPrice Vendor price per unit in copper (0 = can't be sold)
+---@return number|nil stackSize Most units that fit in one bag slot (1 = doesn't stack)
 local function getItemDetails(itemID)
-    local name, _, quality, _, _, _, _, _, _, _, sellPrice = C_Item.GetItemInfo(itemID)
-    return name, quality, sellPrice
+    local name, _, quality, _, _, _, _, stackSize, _, _, sellPrice = C_Item.GetItemInfo(itemID)
+    return name, quality, sellPrice, stackSize
+end
+
+--- Whether an item is bought in bulk on the Auction House (by quantity, in one purchase)
+--- rather than one listing at a time. The modern AH treats stackable items as bulk
+--- (commodities). Blizzard's own check (C_AuctionHouse.GetItemCommodityStatus) needs an
+--- item in the bags, so the max stack size is used instead.
+---@param stackSize number|nil From getItemDetails
+---@return boolean
+local function isBulkItem(stackSize)
+    return (stackSize or 1) > 1
 end
 
 --- Returns an item's vendor price per unit, using the scan's cache when possible.
---- The name and quality are cached from the same lookup. They used to be looked up again
+--- The name, quality and stack size are cached from the same lookup. The name used to be
+--- looked up again
 --- when the item's first row was made, and with 200,000+ auctions read in between, the
 --- game could have dropped the item from its cache by then, leaving the name empty.
 --- Only known prices are cached, so an uncached item is looked up again next time.
@@ -121,12 +134,13 @@ end
 local function getVendorPrice(scan, itemID)
     local price = scan.vendorPrices[itemID]
     if price == nil then
-        local name, quality
-        name, quality, price = getItemDetails(itemID)
+        local name, quality, stackSize
+        name, quality, price, stackSize = getItemDetails(itemID)
         if price ~= nil then
             scan.vendorPrices[itemID] = price
             scan.names[itemID] = name
             scan.qualities[itemID] = quality
+            scan.stackSizes[itemID] = stackSize
         end
     end
     return price
@@ -153,6 +167,7 @@ local function addListing(scan, itemID, count, buyout, unitVendorPrice)
         scan.items[itemID] = {
             name = scan.names[itemID],
             quality = scan.qualities[itemID],
+            bulk = isBulkItem(scan.stackSizes[itemID]), -- bought by quantity, not per listing
             vendorPrice = unitVendorPrice,  -- copper per unit
             lowestBuyout = buyout,          -- an auction at the lowest unit price:
             lowestCount = count,            --   unit price = lowestBuyout / lowestCount
@@ -170,13 +185,14 @@ local function addListing(scan, itemID, count, buyout, unitVendorPrice)
     end
 end
 
---- Fills in a row's name and quality once its item data has loaded.
+--- Fills in a row's name, quality and bulk flag once its item data has loaded.
 --- The callback for fillMissingNames; tells the window to redraw.
 ---@param row table A saved result row
 ---@param itemID number
 local function fillName(row, itemID)
-    local name, quality = getItemDetails(itemID)
+    local name, quality, _, stackSize = getItemDetails(itemID)
     row.name, row.quality = name, quality or row.quality
+    row.bulk = isBulkItem(stackSize)
     ns.OnScanUpdated()
 end
 
@@ -389,6 +405,7 @@ local function startReading(total)
         vendorPrices = {},
         names = {},
         qualities = {},
+        stackSizes = {},
         held = {},
         heldCount = 0,
         readStartedMs = debugprofilestop(),
@@ -459,7 +476,7 @@ local function isAwaitingAnswer(realm)
 end
 
 --- Returns the current saved results for this realm.
----@return table items items[itemID] = { name, quality, vendorPrice, lowestBuyout, lowestCount, quantity }
+---@return table items items[itemID] = { name, quality, bulk, vendorPrice, lowestBuyout, lowestCount, quantity }
 ---@return number scannedAt time() of the scan, 0 if there has been none
 ---@return number auctionCount Auctions in that scan
 function ns.GetResults()

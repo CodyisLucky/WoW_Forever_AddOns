@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0
+- Items bought in bulk on the Auction House (stackable items, bought by quantity) have their name shown in light blue. Items bought one listing at a time keep their quality color.
+- Results saved by 0.2.0 have no bulk information and show quality colors until the next scan.
+
 ## 0.2.0
 - Buyout, Vendor and Profit are now per item. Each row shows the item's lowest below-vendor unit price, and Qty is the number of units listed at that price.
 - Default sort is highest profit per item, with ties going to the lowest buyout.

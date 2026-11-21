@@ -4,7 +4,7 @@ Target: World of Warcraft: Forever (interface 16001). Not compatible with Retail
 
 Lists Auction House items whose buyout is below what a vendor pays for them, ranked by the profit you'd make buying them and selling them to a vendor.
 
-**Current status (0.2.0):** reads full Auction House scans (from Gathercraft, any other addon, or its own Scan button) and shows the below-vendor items in a movable window. List only: it doesn't buy anything.
+**Current status (0.3.0):** reads full Auction House scans (from Gathercraft, any other addon, or its own Scan button) and shows the below-vendor items in a movable window. List only: it doesn't buy anything.
 
 ## How it works
 
@@ -21,7 +21,7 @@ Scan data is a snapshot, so some listings will have sold by the time you look. T
 
 | Column | Meaning |
 |---|---|
-| Item | Icon and name in quality color. Hover for the item tooltip |
+| Item | Icon and name. The name is light blue for items bought in bulk (stackable items, bought by quantity), otherwise its quality color. Hover for the item tooltip |
 | Qty | Units listed at the lowest price |
 | Buyout | Lowest buyout per unit. Stacks priced in fractions of a copper per unit are rounded to the nearest copper |
 | Vendor | What a vendor pays per unit |
@@ -113,10 +113,11 @@ Reads full scans and builds the results. It owns all scan state, and the window 
 |---|---|---|
 | `getRealmData()` | local | This realm's saved results and timing, created on first use |
 | `countKeys(t)` | local | Counts the entries in a non-array table, for the log summary |
-| `getItemDetails(itemID)` | local | Name, quality and vendor price from `C_Item.GetItemInfo`, nil if not cached |
-| `getVendorPrice(scan, itemID)` | local | Vendor price per unit, cached per scan together with the name and quality |
+| `getItemDetails(itemID)` | local | Name, quality, vendor price and max stack size from `C_Item.GetItemInfo`, nil if not cached |
+| `isBulkItem(stackSize)` | local | Whether an item is bought in bulk (stacks to more than 1) |
+| `getVendorPrice(scan, itemID)` | local | Vendor price per unit, cached per scan together with the name, quality and stack size |
 | `addListing(scan, itemID, count, buyout, unitVendorPrice)` | local | If below vendor, updates the item's row: a lower unit price replaces it, an equal one adds units |
-| `fillName(row, itemID)` | local | Fills a row's name and quality once its item data loads |
+| `fillName(row, itemID)` | local | Fills a row's name, quality and bulk flag once its item data loads |
 | `fillMissingNames(items)` | local | Safety net: requests data for rows without a name and logs how many there were |
 | `endScan(scan)` | local | Clears the active scan, fills missing names, refreshes the window |
 | `finishLoading(scan)` | local | Ends the scan once held items have loaded or timed out, and logs how long loading took |
@@ -156,7 +157,7 @@ The results window. It's created on first show and reads from Scanner.lua throug
 | `updateStatus()` | local | Status line plus Scan button. Runs every second while shown |
 | `onRowEnter(row)` / `hideTooltip()` | local | Item tooltip on hover. `hideTooltip` is shared with the Scan button |
 | `createRowRegions(row)` | local | Creates a row's icon and text cells once per row frame |
-| `initRow(row, element)` | local | Fills a (reused) row frame with one element |
+| `initRow(row, element)` | local | Fills a (reused) row frame with one element. Bulk items get a light-blue name |
 | `updateHeaders()` | local | Shows the sort arrow on the sorted column |
 | `onHeaderClick(column)` | local | Changes or reverses the sort |
 | `createHeader(parent, column)` | local | Creates one clickable column header |
@@ -180,6 +181,7 @@ ForeverVendorSnipeDB.realms["Realm Name"] = {
         [2589] = {               -- itemID (Linen Cloth)
             name = "Linen Cloth",
             quality = 1,         -- Enum.ItemQuality
+            bulk = true,         -- bought by quantity (stacks), not one listing at a time
             vendorPrice = 13,    -- copper per unit
             lowestBuyout = 120,  -- one auction at the lowest unit price:
             lowestCount = 10,    --   unit price = 120 / 10 = 12c
@@ -217,6 +219,7 @@ The example values are illustrative. Unit buyout and profit aren't saved. The wi
 - **Results are saved per realm**, because each realm has its own Auction House. Only the grouped below-vendor rows are saved, not raw auctions, which keeps SavedVariables small.
 - **Lowest price per item, compared exactly.** Each row keeps one auction's `(buyout, count)` at the lowest unit price, plus the units at that price. Unit prices are compared by cross-multiplying (`buyout × lowestCount` vs `lowestBuyout × count`), so stack prices that work out to fractions of a copper compare exactly. Rounding only happens for display.
 - **Names are read with the vendor price.** In 0.1.0 the name was looked up later, when the item's row was created. With 200,000+ auctions read in between, the game could drop the item from its cache, so some rows had no name. Now both come from one `C_Item.GetItemInfo` call. `fillMissingNames` is a safety net that logs a count, which should stay 0.
+- **Bulk is decided by stack size.** The modern AH sells stackable items as commodities, bought by quantity in one purchase. Blizzard's `C_AuctionHouse.GetItemCommodityStatus` would say so directly, but it takes an item in the bags, not an item ID. So an item that stacks to more than 1 counts as bulk. The stack size comes from the `C_Item.GetItemInfo` call the scanner already makes. No format bump: rows from 0.2.0 just lack the flag until the next scan.
 - **Derived values aren't saved.** Unit buyout, profit and lowercase names are added to fresh list elements in `buildElements`, so SavedVariables only hold scan data.
 - **The log lives in SavedVariables.** Addons can't write files, so the log is a capped list of lines in its own SavedVariable, written to disk on `/reload` or logout. It's always on, because problems are usually noticed after the fact. `/vsnipe debug` only controls chat output.
 - **Error capture.** Event handlers, timer and item-load callbacks, and the window's handlers run through `ns.SafeCall`, which logs an error and then passes it to the game's error handler, so nothing that BugSack or the default popup would show is hidden. A repeating error is logged in full once, then only on the 2nd, 4th, 8th… time, so it can't push everything else out of the 500-line log. Row hover tooltips aren't wrapped, since they only call Blizzard's tooltip.

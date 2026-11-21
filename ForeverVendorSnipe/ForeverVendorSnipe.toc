@@ -2,7 +2,7 @@
 ## Title: Forever Vendor Snipe
 ## Notes: Lists Auction House items selling for less than their vendor price, ranked by profit.
 ## Author: Cody
-## Version: 0.2.0
+## Version: 0.3.0
 ## Category: Auction
 ## IconTexture: Interface\Icons\INV_Misc_Coin_02
 ## SavedVariables: ForeverVendorSnipeDB, ForeverVendorSnipeLog
