@@ -1,8 +1,8 @@
 ## Interface: 16001
 ## Title: Forever Vendor Snipe
-## Notes: Lists Auction House items selling for less than their vendor price, and items whose cheapest auction undercuts the next one by the most.
+## Notes: Lists Auction House items selling for less than their vendor price, items whose cheapest auction undercuts the next one by the most, and what each Waylaid Crate costs to buy and fill.
 ## Author: Cody
-## Version: 0.4.0
+## Version: 0.5.0
 ## Category: Auction
 ## IconTexture: Interface\Icons\INV_Misc_Coin_02
 ## SavedVariables: ForeverVendorSnipeDB, ForeverVendorSnipeLog
@@ -13,5 +13,8 @@ Log.lua
 ForeverVendorSnipe.lua
 BelowVendor.lua
 Undercuts.lua
+CrateData.lua
+WaylaidCrates.lua
 Scanner.lua
 ResultsWindow.lua
+CrateDump.lua

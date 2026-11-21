@@ -1,21 +1,23 @@
 --[[
     ResultsWindow.lua
     The movable results window: a search box, a status line and the fallback Scan
-    button at the top, and two tabs at the bottom, each with its own page of
+    button at the top, and three tabs at the bottom, each with its own page of
     sortable column headers and a scrolling list.
-      Below Vendor  each variant's lowest below-vendor price, its vendor price, and
-                    the profit on each unit bought at that price
-      Undercuts     the variants whose cheapest auction is furthest below the
-                    second cheapest, per unit
-    Search, Scan and the status line are shared by both tabs. The selected tab is
+      Below Vendor    each variant's lowest below-vendor price, its vendor price, and
+                      the profit on each unit bought at that price
+      Undercuts       the variants whose cheapest auction is furthest below the
+                      second cheapest, per unit
+      Waylaid Crates  every crate's cheapest price, its cheapest fill bundle, and
+                      the total to buy and fill one
+    Search, Scan and the status line are shared by all tabs. The selected tab is
     saved (ns.db.selectedTab); each tab keeps its own sort while the game runs.
     Opens when the Auction House opens, closes when it closes, and /vsnipe toggles
     it at any time to show the last saved scan.
 
     The window is created the first time it's shown (after ADDON_LOADED, so ns.db
     exists). It reads everything from Scanner.lua (ns.GetVendorRows,
-    ns.GetUndercutRows, ns.GetScanInfo, ns.GetScanStatus, ns.GetScanCooldown) and
-    never changes scan data.
+    ns.GetUndercutRows, ns.GetCrateRows, ns.GetScanInfo, ns.GetScanStatus,
+    ns.GetScanCooldown) and never changes scan data.
 ]]
 
 local _, ns = ...
@@ -24,7 +26,9 @@ local L = ns.L
 
 local WINDOW_NAME = "ForeverVendorSnipeFrame"
 local WINDOW_TEMPLATE = "BasicFrameTemplateWithInset"
-local WINDOW_STRATA = "HIGH"
+-- Same layer as Blizzard's bags and Auction House frame (both MEDIUM), so with
+-- SetToplevel whichever was clicked last is drawn on top. HIGH covered the bags.
+local WINDOW_STRATA = "MEDIUM"
 local WINDOW_WIDTH = 680
 local WINDOW_HEIGHT = 460
 local PADDING = 12
@@ -60,6 +64,13 @@ local REFRESH_DELAY = 0.2 -- seconds, batches many scan updates into one redraw
 local DEFAULT_QUALITY = Enum.ItemQuality.Common
 -- Name color for items bought in bulk (by quantity) instead of one listing at a time.
 local BULK_NAME_COLOR = { r = 0.4, g = 0.8, b = 1.0 } -- light blue, #66CCFF
+-- Waylaid Crates tooltip: the cheapest bundle, other bundles, and bundles the AH can't fill.
+local BEST_BUNDLE_COLOR = { r = 0.1, g = 1.0, b = 0.1 }  -- green
+local BUNDLE_COLOR = { r = 1.0, g = 1.0, b = 1.0 }       -- white
+local SHORT_BUNDLE_COLOR = { r = 0.5, g = 0.5, b = 0.5 } -- grey
+-- Sort value for a price that can't be worked out (shown as L.NO_VALUE). Bigger than
+-- any price, so those rows sort last when sorting low to high.
+local NO_PRICE = math.huge
 local SECONDS_PER_MINUTE = 60
 local SECONDS_PER_HOUR = 60 * 60
 local SECONDS_PER_DAY = 24 * 60 * 60
@@ -99,6 +110,24 @@ local function formatQuantity(count)
     return BreakUpLargeNumbers(count)
 end
 
+--- Formats a price like formatMoney, or L.NO_VALUE ("—") for NO_PRICE.
+--- Used by the Waylaid Crates columns, whose prices can be missing.
+---@param copper number A price, or NO_PRICE
+---@return string
+local function formatMoneyOrNone(copper)
+    if copper == NO_PRICE then
+        return L.NO_VALUE
+    end
+    return formatMoney(copper)
+end
+
+--- Formats a fill bundle as its quantity and item name, e.g. "20 Light Leather".
+---@param bundle table A bundle from a saved crate row
+---@return string
+local function formatBundle(bundle)
+    return L.BUNDLE:format(bundle.quantity, bundle.name)
+end
+
 -- Columns per tab, left to right. key is the field on a list element (see the tab's
 -- makeElement), format turns that field into the cell's text (the Item column is
 -- filled by setNameCell instead). ascendingFirst: the first click sorts A-Z / low-high
@@ -118,10 +147,22 @@ local UNDERCUT_COLUMNS = {
     { key = "difference", label = L.COL_DIFFERENCE, width = 100, justify = "RIGHT", format = formatMoney },
 }
 
+-- Level, Favor and Fill with are already plain values, so tostring is their format.
+-- Fill / Favor and Total / Favor are per Merchant's Favor (see ns.GetCrateCosts).
+local CRATE_COLUMNS = {
+    { key = "name", label = L.COL_CRATE, width = 150, justify = "LEFT", ascendingFirst = true },
+    { key = "level", label = L.COL_LEVEL, width = 30, justify = "RIGHT", format = tostring, ascendingFirst = true },
+    { key = "favor", label = L.COL_FAVOR, width = 40, justify = "RIGHT", format = tostring },
+    { key = "crateUnit", label = L.COL_CRATE_PRICE, width = 80, justify = "RIGHT", format = formatMoneyOrNone, ascendingFirst = true },
+    { key = "fill", label = L.COL_FILL, width = 125, justify = "LEFT", format = tostring, ascendingFirst = true },
+    { key = "fillPerFavor", label = L.COL_FILL_PER_FAVOR, width = 80, justify = "RIGHT", format = formatMoneyOrNone, ascendingFirst = true },
+    { key = "totalPerFavor", label = L.COL_TOTAL_PER_FAVOR, width = 80, justify = "RIGHT", format = formatMoneyOrNone, ascendingFirst = true },
+}
+
 --- Gives each column its x position inside a row, from the column widths and CELL_GAP.
 --- Called once per column set at load. Headers and row cells both use column.offset,
 --- so they line up.
----@param columns table VENDOR_COLUMNS or UNDERCUT_COLUMNS
+---@param columns table VENDOR_COLUMNS, UNDERCUT_COLUMNS or CRATE_COLUMNS
 local function computeColumnOffsets(columns)
     local x = 0
     for _, column in ipairs(columns) do
@@ -131,8 +172,9 @@ local function computeColumnOffsets(columns)
 end
 computeColumnOffsets(VENDOR_COLUMNS)
 computeColumnOffsets(UNDERCUT_COLUMNS)
+computeColumnOffsets(CRATE_COLUMNS)
 
---- The last tie-breakers for both tabs: name (case-insensitive), then item ID, so the
+--- The last tie-breakers for every tab: name (case-insensitive), then item ID, so the
 --- order is always the same. Two variants of one item differ by name, so they never
 --- reach the item ID check.
 ---@return boolean aFirst Whether element a sorts before element b
@@ -167,6 +209,18 @@ local function compareUndercutDefault(a, b)
     return compareByName(a, b)
 end
 
+--- Waylaid Crates' default order: lowest total per Merchant's Favor first (crates without
+--- one last, see NO_PRICE), then lowest level, then compareByName.
+---@return boolean aFirst Whether element a sorts before element b
+local function compareCrateDefault(a, b)
+    if a.totalPerFavor ~= b.totalPerFavor then
+        return a.totalPerFavor < b.totalPerFavor
+    elseif a.level ~= b.level then
+        return a.level < b.level
+    end
+    return compareByName(a, b)
+end
+
 --- Builds a Below Vendor list element's columns from a saved row: units at the lowest
 --- price, unit buyout, vendor price and profit per unit. Derived values are worked out
 --- here so they never end up in SavedVariables.
@@ -195,15 +249,79 @@ local function makeUndercutElement(row)
     }
 end
 
+--- Builds a Waylaid Crates list element's columns from a saved row, using
+--- ns.GetCrateCosts for the crate price, cheapest bundle, Favor, and costs per Favor.
+--- Missing prices become NO_PRICE, so they sort and display consistently ("—").
+--- The bundles and turn-in money are kept for the row tooltip (addCrateTooltipLines).
+---@param row table A saved crate row
+---@return table element The tab-specific fields (buildElements adds the shared ones)
+local function makeCrateElement(row)
+    local costs = ns.GetCrateCosts(row)
+    return {
+        level = row.level,
+        -- A number either way, so the column can sort. 0 only for a saved row whose crate
+        -- was removed from ns.CRATES, until the next scan drops it.
+        favor = costs.favor or 0,
+        crateUnit = costs.crateUnit or NO_PRICE,
+        fill = costs.bestBundle and formatBundle(costs.bestBundle) or L.NO_VALUE,
+        fillPerFavor = costs.fillPerFavor or NO_PRICE,
+        totalPerFavor = costs.totalPerFavor or NO_PRICE,
+        bundles = row.bundles,
+        bestBundle = costs.bestBundle,
+        money = costs.money,
+    }
+end
+
+--- The text the search box matches for a crate row: its name and every bundle's item
+--- name, lowercase, one per line (so a search can't match across two names).
+---@param row table A saved crate row
+---@return string text
+local function getCrateSearchText(row)
+    local names = { row.name or "" }
+    for _, bundle in ipairs(row.bundles) do
+        names[#names + 1] = bundle.name
+    end
+    return table.concat(names, "\n"):lower()
+end
+
+--- Adds the turn-in reward and every fill bundle's whole cost below a crate's item
+--- tooltip. The reward line shows the Favor and the money that Total / Favor subtracts.
+--- The cheapest bundle (the one in the Fill with column) is green, and bundles the AH
+--- can't fill show how many units are short, in grey.
+---@param tooltip GameTooltip The tooltip, already showing the crate
+---@param element table The row's list element (makeCrateElement)
+local function addCrateTooltipLines(tooltip, element)
+    tooltip:AddLine(" ")
+    if element.money then
+        tooltip:AddLine(L.TOOLTIP_REWARD:format(tostring(element.favor), formatMoney(element.money)))
+    end
+    tooltip:AddLine(L.TOOLTIP_BUNDLES)
+    for _, bundle in ipairs(element.bundles) do
+        local color, right
+        if not bundle.cost then
+            color, right = SHORT_BUNDLE_COLOR, L.TOOLTIP_SHORT:format(bundle.short)
+        elseif bundle == element.bestBundle then
+            color, right = BEST_BUNDLE_COLOR, formatMoney(bundle.cost)
+        else
+            color, right = BUNDLE_COLOR, formatMoney(bundle.cost)
+        end
+        tooltip:AddDoubleLine(formatBundle(bundle), right,
+            color.r, color.g, color.b, color.r, color.g, color.b)
+    end
+end
+
 -- The tabs, in display order. Fields:
---   id              saved in ns.db.selectedTab
---   label           tab button text
---   columns         the page's columns (see VENDOR_COLUMNS)
---   defaultSortKey  column sorted by when the game starts
---   getRows         returns the saved rows to show (from Scanner.lua)
---   makeElement     builds a row's tab-specific element fields
---   compareDefault  the default order, also the tie-breaker for every column
---   emptyText       shown when the last scan found nothing for this tab
+--   id                   saved in ns.db.selectedTab
+--   label                tab button text
+--   columns              the page's columns (see VENDOR_COLUMNS)
+--   defaultSortKey       column sorted by when the game starts
+--   defaultSortAscending optional: true to start that sort low to high (default high to low)
+--   getRows              returns the saved rows to show (from Scanner.lua)
+--   makeElement          builds a row's tab-specific element fields
+--   getSearchText        optional: a row's lowercase text for the search box (default its name)
+--   addTooltipLines      optional: adds lines below a row's item tooltip
+--   compareDefault       the default order, also the tie-breaker for every column
+--   emptyText            shown when the last scan found nothing for this tab
 -- createPage adds the runtime fields: sortKey, sortAscending, page, headers,
 -- scrollBox, emptyTextFrame.
 local TABS = {
@@ -226,6 +344,19 @@ local TABS = {
         makeElement = makeUndercutElement,
         compareDefault = compareUndercutDefault,
         emptyText = L.EMPTY_UNDERCUTS,
+    },
+    {
+        id = "crates",
+        label = L.TAB_CRATES,
+        columns = CRATE_COLUMNS,
+        defaultSortKey = "totalPerFavor",
+        defaultSortAscending = true,
+        getRows = ns.GetCrateRows,
+        makeElement = makeCrateElement,
+        getSearchText = getCrateSearchText,
+        addTooltipLines = addCrateTooltipLines,
+        compareDefault = compareCrateDefault,
+        emptyText = L.EMPTY_CRATES,
     },
 }
 
@@ -250,7 +381,8 @@ end
 --- Each row becomes a new element: the tab's own columns (makeElement) plus the fields
 --- every tab shares (item ID, name, lowercase name, link, quality, bulk flag), so
 --- nothing derived ends up in SavedVariables. The search is a plain, case-insensitive
---- substring match on the item name, which includes any suffix.
+--- substring match on the item name, which includes any suffix, or on the tab's own
+--- search text when it has a getSearchText (Waylaid Crates adds the fill items).
 ---@param tab table An entry from TABS
 ---@return table elements Sorted list elements
 ---@return boolean hasResults Whether the last scan found anything for this tab, before the search filter
@@ -260,7 +392,8 @@ local function buildElements(tab)
     local elements = {}
     for _, row in pairs(rows) do
         local sortName = (row.name or ""):lower()
-        if query == "" or sortName:find(query, 1, true) then
+        local searchText = tab.getSearchText and tab.getSearchText(row) or sortName
+        if query == "" or searchText:find(query, 1, true) then
             local element = tab.makeElement(row)
             element.itemID = row.itemID
             element.name = row.name
@@ -340,14 +473,19 @@ local function updateStatus()
 end
 
 --- Shows the item's tooltip while the mouse is over a row. Suffixed variants have a
---- link, which shows the suffix's stats; other rows show the item by ID.
+--- link, which shows the suffix's stats; other rows show the item by ID. Tabs with an
+--- addTooltipLines (Waylaid Crates) add their own lines below the item.
 ---@param row Button The list row
 local function onRowEnter(row)
+    local element = row.element
     GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
-    if row.link then
-        GameTooltip:SetHyperlink(row.link)
+    if element.link then
+        GameTooltip:SetHyperlink(element.link)
     else
-        GameTooltip:SetItemByID(row.itemID)
+        GameTooltip:SetItemByID(element.itemID)
+    end
+    if row.tab.addTooltipLines then
+        row.tab.addTooltipLines(GameTooltip, element)
     end
     GameTooltip:Show()
 end
@@ -359,9 +497,12 @@ end
 
 --- Creates a row's icon and one text cell per column. Runs once per row frame;
 --- the scroll box reuses row frames, so initRow only fills them in afterwards.
+--- Remembers the row's tab (row.tab), which never changes, for the tooltip.
 ---@param row Button A row frame created by the scroll box
----@param columns table The page's columns
-local function createRowRegions(row, columns)
+---@param tab table The entry from TABS whose page the row is on
+local function createRowRegions(row, tab)
+    local columns = tab.columns
+    row.tab = tab
     row:SetHighlightTexture(ROW_HIGHLIGHT_TEXTURE, "ADD")
     row.icon = row:CreateTexture(nil, "ARTWORK")
     row.icon:SetSize(ICON_SIZE, ICON_SIZE)
@@ -403,19 +544,19 @@ local function setNameCell(row, element)
 end
 
 --- Fills a row with one list element: icon and name (setNameCell), then every other
---- column through its format function. Remembers the item ID and link for the tooltip.
+--- column through its format function. Remembers the element for the tooltip.
 --- The scroll box calls this (through createPage's initializer) whenever a row frame
 --- is shown for an element.
 ---@param row Button The row frame
 ---@param element table A list element from buildElements
----@param columns table The page's columns
-local function initRow(row, element, columns)
+---@param tab table The entry from TABS whose page the row is on
+local function initRow(row, element, tab)
     if not row.cells then
-        createRowRegions(row, columns)
+        createRowRegions(row, tab)
     end
-    row.itemID, row.link = element.itemID, element.link
+    row.element = element
     setNameCell(row, element)
-    for _, column in ipairs(columns) do
+    for _, column in ipairs(tab.columns) do
         if column.format then
             row.cells[column.key]:SetText(column.format(element[column.key]))
         end
@@ -508,7 +649,7 @@ local function onScanButtonClick()
 end
 
 --- Creates the title, search box, Scan button and status line at the top of the window.
---- These are shared by both tabs. Typing in the search box refreshes the showing tab's
+--- These are shared by every tab. Typing in the search box refreshes the showing tab's
 --- list (through ns.SafeCall, so errors are logged). HookScript keeps the template's
 --- own OnTextChanged, which shows and hides the "Search" placeholder.
 ---@param frame Frame The window
@@ -543,7 +684,7 @@ end
 --- Uses Blizzard's ScrollBox with a linear view: only visible rows have frames, which
 --- are reused as the list scrolls (initRow fills them in). Each page has its own
 --- scroll box, so each tab keeps its own rows and scroll position. Also sets the tab's
---- starting sort.
+--- starting sort (high to low unless the tab sets defaultSortAscending).
 ---@param frame Frame The window
 ---@param tab table An entry from TABS (runtime fields are added to it)
 local function createPage(frame, tab)
@@ -552,7 +693,7 @@ local function createPage(frame, tab)
     page:Hide()
     tab.page = page
     tab.sortKey = tab.defaultSortKey
-    tab.sortAscending = false
+    tab.sortAscending = tab.defaultSortAscending == true
 
     tab.headers = {}
     for _, column in ipairs(tab.columns) do
@@ -569,9 +710,9 @@ local function createPage(frame, tab)
 
     local view = CreateScrollBoxListLinearView()
     view:SetElementExtent(ROW_HEIGHT)
-    -- The initializer only gets (row, element), so this closure supplies the page's columns.
+    -- The initializer only gets (row, element), so this closure supplies the page's tab.
     view:SetElementInitializer("Button", function(row, element)
-        initRow(row, element, tab.columns)
+        initRow(row, element, tab)
     end)
     ScrollUtil.InitScrollBoxListWithScrollBar(tab.scrollBox, scrollBar, view)
 

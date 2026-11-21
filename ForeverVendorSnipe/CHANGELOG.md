@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+- New **Waylaid Crates** tab: all 30 Waylaid Crates with their required level, the Merchant's Favor each gives when turned in, the cheapest crate's price, and the cheapest bundle to fill one. **Fill / Favor** is that bundle's cost per Favor, and **Total / Favor** is (crate price + bundle cost − turn-in money) per Favor. Fill costs add up the cheapest listings until the bundle is complete. Hover a crate for its reward and every bundle's whole cost. Prices that can't be worked out show "—". Default sort is lowest Total / Favor first.
+- Artisan crate rewards (20 / 40 Favor) are assumed from the other tiers until confirmed in game.
+- Search on the Waylaid Crates tab also matches the items that fill a crate.
+- New `/vsnipe crates`: with "Waylaid Crate" searched in the Auction House, writes every crate in the results to the log (ID, required level, listings, cheapest price, and the tooltip's fill bundles), for keeping the crate list up to date.
+- The results window no longer always covers your bags. It shares their layer now, so whichever you clicked last is on top.
+- Saved results from 0.4.x are kept. The Waylaid Crates tab fills in with the next scan.
+
 ## 0.4.0
 - New **Undercuts** tab: the 200 items whose cheapest auction is furthest below the second cheapest auction, per unit, sorted by the difference. Columns: Item, Lowest, 2nd lowest, Difference.
 - The window now has two tabs along the bottom, **Below Vendor** and **Undercuts**. Search, Scan and the status line are shared, and the window reopens on the last tab used.

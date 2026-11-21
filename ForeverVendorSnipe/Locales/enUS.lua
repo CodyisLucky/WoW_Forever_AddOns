@@ -27,6 +27,17 @@ ns.L = {
     CMD_CLEARLOG = "Clear the saved log",
     CMD_TOGGLE = "Show or hide the results window",
     CMD_SCAN = "Start a full Auction House scan (shares the 15-minute cooldown with other addons)",
+    CMD_CRATES = "Write the Waylaid Crates in the current Auction House search to the log",
+
+    -- Crate dump (CrateDump.lua)
+    -- %s = slash command
+    CRATES_NO_SEARCH = "No search results. Search the Auction House for \"Waylaid Crate\", then run %s crates again.",
+    -- %d = items not loaded, %s = slash command
+    CRATES_NOT_LOADED = "%d results weren't loaded yet. Run %s crates again in a few seconds.",
+    CRATES_PARTIAL = "Not all search results are loaded. Scroll to the bottom of the Auction House list and run it again.",
+    -- %d = crates logged
+    CRATES_LOGGED = "Logged %d Waylaid Crates. /reload to write the log to disk.",
+    CRATES_NONE = "No Waylaid Crates in the current search results.",
 
     -- Scanner messages
     SCAN_NEED_AH = "Open the Auction House first.",
@@ -57,6 +68,23 @@ ns.L = {
     COL_DIFFERENCE = "Difference",
     TAB_VENDOR = "Below Vendor",
     TAB_UNDERCUTS = "Undercuts",
+    TAB_CRATES = "Waylaid Crates",
+    COL_CRATE = "Crate",
+    COL_LEVEL = "Lvl",
+    COL_CRATE_PRICE = "Price",
+    COL_FILL = "Fill with",
+    COL_FAVOR = "Favor",
+    COL_FILL_PER_FAVOR = "Fill / Favor",
+    COL_TOTAL_PER_FAVOR = "Total / Favor",
+    -- Shown for a price that can't be worked out (no crate listed, not enough to fill one)
+    NO_VALUE = "—",
+    -- %d = quantity, %s = item name
+    BUNDLE = "%d %s",
+    -- %s = Merchant's Favor, %s = money paid (formatted)
+    TOOLTIP_REWARD = "Turn-in: %s Merchant's Favor and %s",
+    TOOLTIP_BUNDLES = "Fill with any one of (whole bundle):",
+    -- %d = units missing on the Auction House
+    TOOLTIP_SHORT = "%d short",
     STATUS_NONE = "No scan yet. Gathercraft scans when you open the Auction House, or press Scan.",
     STATUS_WAITING = "Waiting for the Auction House to answer...",
     -- %d = percent read
@@ -67,6 +95,7 @@ ns.L = {
     STATUS_LOADING = "  (loading %d items)",
     EMPTY_LIST = "No items below vendor price in the last scan.",
     EMPTY_UNDERCUTS = "No item had a second auction priced higher than its cheapest in the last scan.",
+    EMPTY_CRATES = "Waylaid Crate prices appear after the next scan.",
     EMPTY_SEARCH = "No items match your search.",
     AGE_NOW = "just now",
     -- %d = minutes / hours / days

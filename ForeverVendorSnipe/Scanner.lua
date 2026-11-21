@@ -1,8 +1,9 @@
 --[[
     Scanner.lua
     Reads full Auction House scans, groups the auctions into item variants, and
-    feeds each auction to the two result builders: BelowVendor.lua (lowest price
-    below vendor) and Undercuts.lua (cheapest vs second cheapest auction).
+    feeds each auction to the result builders: BelowVendor.lua (lowest price
+    below vendor), Undercuts.lua (cheapest vs second cheapest auction) and
+    WaylaidCrates.lua (auctions of crates and their fill items).
 
     A variant is an item ID plus the name shown in the auction's item link, so
     "Axe of the Monkey" and "Axe of the Bear" are separate even though they share
@@ -33,6 +34,7 @@ local debugprofilestop = debugprofilestop
 local pcall = pcall
 local addVendorListing = ns.AddVendorListing
 local addUndercutListing = ns.AddUndercutListing
+local addCrateListing = ns.AddCrateListing
 
 local SCAN_COOLDOWN = 15 * 60 -- seconds the server waits between full scans
 -- REPLICATE_ITEM_LIST_UPDATE fires 100+ times for a single scan. A new scan can't
@@ -72,6 +74,7 @@ local ahOpen = false
 --   startedAt     time() when reading began, saved as the results' scan time
 --   vendorRows    Below Vendor rows being built: vendorRows[variant.key] = row (BelowVendor.lua)
 --   undercuts     undercut entries being built: undercuts[variant.key] = entry (Undercuts.lua)
+--   crateListings auctions of crates and fill items: crateListings[itemID] = { count, buyout, ... } (WaylaidCrates.lua)
 --   itemInfo      itemInfo[itemID] = { name, quality, vendorPrice, bulk } for items already looked up
 --   variants      variants[itemID][name] = variant (see getVariant)
 --   held          held[itemID] = { count, buyout, link, count, buyout, link, ... } for items not cached yet
@@ -92,7 +95,9 @@ local ignoreEventsUntil = 0
 --- Results are kept per realm because each realm has its own Auction House.
 --- Results saved in an older format (resultsFormat ~= RESULTS_FORMAT) are discarded,
 --- since the window can't read them; the scan timing is kept so the cooldown still works.
----@return table realm { items, undercuts, scannedAt, auctionCount, resultsFormat, lastScanSeenAt, lastRequestAt }
+--- The crate rows (0.5.0) were added without a format change, so results saved by
+--- 0.4.x keep their other lists and just get an empty crate list until the next scan.
+---@return table realm { items, undercuts, crates, scannedAt, auctionCount, resultsFormat, lastScanSeenAt, lastRequestAt }
 local function getRealmData()
     local realmName = GetRealmName()
     local realm = ns.db.realms[realmName]
@@ -109,6 +114,9 @@ local function getRealmData()
         realm.scannedAt = 0        -- time() of the scan the results come from
         realm.auctionCount = 0     -- auctions in that scan
         realm.resultsFormat = RESULTS_FORMAT
+    end
+    if type(realm.crates) ~= "table" then
+        realm.crates = {}          -- Waylaid Crates rows, in ns.CRATES order (WaylaidCrates.lua)
     end
     return realm
 end
@@ -291,11 +299,15 @@ end
 --- The Below Vendor rows are saved as the live table, so held items that load later
 --- show up straight away. The undercut list is a pick from all entries
 --- (ns.PickTopUndercuts), so it's saved again when loading ends (finishLoading).
+--- The crate rows are built from the kept crate and fill-item auctions
+--- (ns.BuildCrateRows). Those never wait for item data, so rebuilding them when
+--- loading ends gives the same rows.
 ---@param scan table The scan whose results to save
 local function saveResults(scan)
     local realm = getRealmData()
     realm.items = scan.vendorRows
     realm.undercuts = ns.PickTopUndercuts(scan.undercuts)
+    realm.crates = ns.BuildCrateRows(scan.crateListings)
     realm.scannedAt = scan.startedAt
     realm.auctionCount = scan.total
 end
@@ -382,15 +394,18 @@ local function holdListing(scan, itemID, count, buyout, link)
 end
 
 --- Sorts one auction: cached items go to the results, uncached items are held.
---- The link is only read when the item might have a suffix: when it isn't known to be
---- a bulk (stacking) item. Items already being held skip the cache lookup, so only one
---- load is requested per item.
+--- Every auction is first offered to the crate builder (ns.AddCrateListing), which
+--- only needs the item ID, so crate and fill-item auctions count even when the item
+--- isn't cached. The link is only read when the item might have a suffix: when it
+--- isn't known to be a bulk (stacking) item. Items already being held skip the cache
+--- lookup, so only one load is requested per item.
 ---@param scan table The active scan
 ---@param index number 0-based auction index, for reading the link
 ---@param itemID number
 ---@param count number
 ---@param buyout number
 local function considerAuction(scan, index, itemID, count, buyout)
+    addCrateListing(scan.crateListings, itemID, count, buyout)
     if scan.held[itemID] then
         holdListing(scan, itemID, count, buyout, readLink(index))
         return
@@ -496,6 +511,7 @@ local function startReading(total)
         startedAt = time(),
         vendorRows = {},
         undercuts = {},
+        crateListings = {},
         itemInfo = {},
         variants = {},
         held = {},
@@ -590,6 +606,12 @@ end
 ---@return table rows Array, largest gap first: { itemID, name, link, quality, bulk, lowestBuyout, lowestCount, secondBuyout, secondCount }
 function ns.GetUndercutRows()
     return getRealmData().undercuts
+end
+
+--- Returns the saved Waylaid Crates rows for this realm.
+---@return table rows Array in ns.CRATES order: { itemID, name, level, quality, bulk, lowestBuyout, lowestCount, bundles }
+function ns.GetCrateRows()
+    return getRealmData().crates
 end
 
 --- Returns when the saved results were scanned and how many auctions the scan had.

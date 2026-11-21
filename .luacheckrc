@@ -39,6 +39,7 @@ read_globals = {
     "C_Navigation",
     "C_SuperTrack",
     "C_Timer",
+    "C_TooltipInfo",
     "Settings",
 
     -- Blizzard UI objects and mixins
