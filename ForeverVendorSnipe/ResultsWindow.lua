@@ -2,6 +2,8 @@
     ResultsWindow.lua
     The movable results window: a search box, a status line, the fallback Scan
     button, sortable column headers and a scrolling list with one row per item.
+    Prices are per unit: the item's lowest below-vendor buyout, its vendor price,
+    and the profit on each unit bought at that price.
     Opens when the Auction House opens, closes when it closes, and /vsnipe toggles
     it at any time to show the last saved scan.
 
@@ -53,12 +55,12 @@ local SECONDS_PER_DAY = 24 * 60 * 60
 local COLUMNS = {
     { key = "name", label = L.COL_ITEM, width = 250, justify = "LEFT", ascendingFirst = true },
     { key = "quantity", label = L.COL_QUANTITY, width = 70, justify = "RIGHT" },
-    { key = "buyout", label = L.COL_BUYOUT, width = 100, justify = "RIGHT" },
-    { key = "vendorValue", label = L.COL_VENDOR, width = 100, justify = "RIGHT" },
+    { key = "unitBuyout", label = L.COL_BUYOUT, width = 100, justify = "RIGHT" },
+    { key = "vendorPrice", label = L.COL_VENDOR, width = 100, justify = "RIGHT" },
     { key = "profit", label = L.COL_PROFIT, width = 100, justify = "RIGHT" },
 }
 
--- Default sort: highest profit first (ties: lowest buyout, see compareDefault).
+-- Default sort: highest profit per unit first (ties: lowest buyout, see compareDefault).
 local DEFAULT_SORT_KEY = "profit"
 local sortKey = DEFAULT_SORT_KEY
 local sortAscending = false
@@ -91,14 +93,23 @@ local function formatAge(seconds)
     return L.AGE_DAYS:format(math.floor(seconds / SECONDS_PER_DAY))
 end
 
---- The default ordering: highest profit, then lowest buyout ("what costs the least"),
---- then name and item ID so the order is always the same.
+--- Formats a copper amount as gold/silver/copper with coin icons.
+--- Rounds to the nearest copper first: unit prices from stacks can have fractions
+--- (7 for 1s is 14.29c each), and GetMoneyString expects whole copper.
+---@param copper number
+---@return string
+local function formatMoney(copper)
+    return GetMoneyString(math.floor(copper + 0.5), true)
+end
+
+--- The default ordering: highest profit per unit, then lowest unit buyout ("what costs
+--- the least"), then name and item ID so the order is always the same.
 ---@return boolean aFirst Whether element a sorts before element b
 local function compareDefault(a, b)
     if a.profit ~= b.profit then
         return a.profit > b.profit
-    elseif a.buyout ~= b.buyout then
-        return a.buyout < b.buyout
+    elseif a.unitBuyout ~= b.unitBuyout then
+        return a.unitBuyout < b.unitBuyout
     elseif a.sortName ~= b.sortName then
         return a.sortName < b.sortName
     end
@@ -121,9 +132,9 @@ local function compareElements(a, b)
 end
 
 --- Builds the sorted list shown in the window from the saved results and the search text.
---- Copies each saved row into a new element with its derived fields (profit, lowercase
---- name), so nothing derived ends up in SavedVariables. The search is a plain,
---- case-insensitive substring match on the item name.
+--- Copies each saved row into a new element with its derived fields (unit buyout,
+--- profit per unit, lowercase name), so nothing derived ends up in SavedVariables.
+--- The search is a plain, case-insensitive substring match on the item name.
 ---@return table elements Sorted list elements
 ---@return boolean hasResults Whether the last scan found anything, before the search filter
 local function buildElements()
@@ -133,16 +144,16 @@ local function buildElements()
     for itemID, row in pairs(items) do
         local sortName = (row.name or ""):lower()
         if query == "" or sortName:find(query, 1, true) then
+            local unitBuyout = row.lowestBuyout / row.lowestCount
             elements[#elements + 1] = {
                 itemID = itemID,
                 name = row.name,
                 sortName = sortName,
                 quality = row.quality,
                 quantity = row.quantity,
-                listings = row.listings,
-                buyout = row.buyout,
-                vendorValue = row.vendorValue,
-                profit = row.vendorValue - row.buyout,
+                unitBuyout = unitBuyout,
+                vendorPrice = row.vendorPrice,
+                profit = row.vendorPrice - unitBuyout,
             }
         end
     end
@@ -249,8 +260,8 @@ local function createRowRegions(row)
     row:SetScript("OnLeave", hideTooltip)
 end
 
---- Fills a row with one list element: icon, name in its quality color, quantity
---- (with the listing count when there's more than one), and the three money columns.
+--- Fills a row with one list element: icon, name in its quality color, units at the
+--- lowest price, and the three per-unit money columns.
 --- The scroll box calls this whenever a row frame is shown for an element.
 ---@param row Button The row frame
 ---@param element table A list element from buildElements
@@ -265,14 +276,10 @@ local function initRow(row, element)
     row.cells.name:SetText(element.name)
     row.cells.name:SetTextColor(r, g, b)
 
-    local quantity = BreakUpLargeNumbers(element.quantity)
-    if element.listings > 1 then
-        quantity = L.QUANTITY_LISTINGS:format(quantity, element.listings)
-    end
-    row.cells.quantity:SetText(quantity)
-    row.cells.buyout:SetText(GetMoneyString(element.buyout, true))
-    row.cells.vendorValue:SetText(GetMoneyString(element.vendorValue, true))
-    row.cells.profit:SetText(GetMoneyString(element.profit, true))
+    row.cells.quantity:SetText(BreakUpLargeNumbers(element.quantity))
+    row.cells.unitBuyout:SetText(formatMoney(element.unitBuyout))
+    row.cells.vendorPrice:SetText(formatMoney(element.vendorPrice))
+    row.cells.profit:SetText(formatMoney(element.profit))
 end
 
 --- Shows the sort arrow on the sorted column only, pointing up for ascending.

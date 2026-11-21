@@ -52,8 +52,6 @@ ns.L = {
     COL_BUYOUT = "Buyout",
     COL_VENDOR = "Vendor",
     COL_PROFIT = "Profit",
-    -- %s = total quantity, %d = number of listings
-    QUANTITY_LISTINGS = "%s (%d)",
     STATUS_NONE = "No scan yet. Gathercraft scans when you open the Auction House, or press Scan.",
     STATUS_WAITING = "Waiting for the Auction House to answer...",
     -- %d = percent read

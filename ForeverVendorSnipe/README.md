@@ -4,14 +4,14 @@ Target: World of Warcraft: Forever (interface 16001). Not compatible with Retail
 
 Lists Auction House items whose buyout is below what a vendor pays for them, ranked by the profit you'd make buying them and selling them to a vendor.
 
-**Current status (0.1.0):** reads full Auction House scans (from Gathercraft, any other addon, or its own Scan button) and shows the below-vendor items in a movable window. List only: it doesn't buy anything.
+**Current status (0.2.0):** reads full Auction House scans (from Gathercraft, any other addon, or its own Scan button) and shows the below-vendor items in a movable window. List only: it doesn't buy anything.
 
 ## How it works
 
 1. Open the Auction House. The results window opens with it, showing the last saved scan.
 2. Gathercraft starts a full scan when the Auction House opens. This addon reads that same scan, so it never uses up the shared cooldown itself.
 3. Every auction with a buyout is compared with the item's vendor price. When `vendor price × stack size` is more than the buyout, the auction counts.
-4. Each item gets one row that adds up all of its below-vendor auctions.
+4. Each item gets one row with its lowest below-vendor price per unit, and how many units are listed at exactly that price. Pricier below-vendor auctions of the same item aren't shown, but the Vendor column lets you judge them once the cheapest ones sell.
 
 The server allows **one full scan every 15 minutes, shared by every addon**. If Gathercraft is disabled or its auto-scan is off, use the window's **Scan** button. It's greyed out with a countdown until 15 minutes have passed since the last scan this addon saw. It can't see Gathercraft's own timer, so the server may still refuse a click, and the window says so after 30 seconds.
 
@@ -22,12 +22,12 @@ Scan data is a snapshot, so some listings will have sold by the time you look. T
 | Column | Meaning |
 |---|---|
 | Item | Icon and name in quality color. Hover for the item tooltip |
-| Qty | Total units across the item's below-vendor auctions, with the auction count in brackets when there's more than one, e.g. `45 (3)` |
-| Buyout | Sum of those auctions' buyouts |
-| Vendor | What a vendor pays for all those units |
-| Profit | Vendor minus Buyout |
+| Qty | Units listed at the lowest price |
+| Buyout | Lowest buyout per unit. Stacks priced in fractions of a copper per unit are rounded to the nearest copper |
+| Vendor | What a vendor pays per unit |
+| Profit | Vendor minus Buyout, per unit |
 
-- **Default sort:** highest profit first. Ties go to the lowest buyout.
+- **Default sort:** highest profit per unit first. Ties go to the lowest buyout.
 - **Sorting:** click a header to sort by it, and click again to reverse.
 - **Search:** filters by item name, ignoring case.
 - **Moving:** drag the window. Its position is saved.
@@ -114,8 +114,11 @@ Reads full scans and builds the results. It owns all scan state, and the window 
 | `getRealmData()` | local | This realm's saved results and timing, created on first use |
 | `countKeys(t)` | local | Counts the entries in a non-array table, for the log summary |
 | `getItemDetails(itemID)` | local | Name, quality and vendor price from `C_Item.GetItemInfo`, nil if not cached |
-| `getVendorPrice(scan, itemID)` | local | Vendor price per unit, cached per scan |
-| `addListing(scan, itemID, count, buyout, unitVendorPrice)` | local | Adds an auction to its item's row if it's below vendor value |
+| `getVendorPrice(scan, itemID)` | local | Vendor price per unit, cached per scan together with the name and quality |
+| `addListing(scan, itemID, count, buyout, unitVendorPrice)` | local | If below vendor, updates the item's row: a lower unit price replaces it, an equal one adds units |
+| `fillName(row, itemID)` | local | Fills a row's name and quality once its item data loads |
+| `fillMissingNames(items)` | local | Safety net: requests data for rows without a name and logs how many there were |
+| `endScan(scan)` | local | Clears the active scan, fills missing names, refreshes the window |
 | `finishLoading(scan)` | local | Ends the scan once held items have loaded or timed out, and logs how long loading took |
 | `resolveHeldListings(scan, itemID)` | local | Checks an item's held auctions once its data arrives |
 | `holdListing(scan, itemID, count, buyout)` | local | Keeps an auction for an uncached item and requests the item's data |
@@ -144,9 +147,10 @@ The results window. It's created on first show and reads from Scanner.lua throug
 |---|---|---|
 | `computeColumnOffsets()` | local | Gives each column its x position, shared by headers and rows |
 | `formatAge(seconds)` | local | `"just now"`, `"12 min ago"`, `"3 h ago"`, `"2 days ago"` |
-| `compareDefault(a, b)` | local | Profit high to low, then buyout low to high, then name, then item ID |
+| `formatMoney(copper)` | local | `GetMoneyString` after rounding to the nearest copper |
+| `compareDefault(a, b)` | local | Profit per unit high to low, then unit buyout low to high, then name, then item ID |
 | `compareElements(a, b)` | local | Sorts by the clicked column, falling back to `compareDefault` |
-| `buildElements()` | local | Copies saved rows into list elements with profit added, filtered by search, sorted |
+| `buildElements()` | local | Copies saved rows into list elements with unit buyout and profit added, filtered by search, sorted |
 | `refreshList()` | local | Sends the elements to the scroll box and shows the empty-list message if needed |
 | `updateScanButton(state)` | local | Scan button label and enabled state (busy, countdown, ready) |
 | `updateStatus()` | local | Status line plus Scan button. Runs every second while shown |
@@ -176,20 +180,21 @@ ForeverVendorSnipeDB.realms["Realm Name"] = {
         [2589] = {               -- itemID (Linen Cloth)
             name = "Linen Cloth",
             quality = 1,         -- Enum.ItemQuality
-            quantity = 45,       -- units across below-vendor auctions
-            listings = 3,        -- number of those auctions
-            buyout = 120,        -- copper, summed
-            vendorValue = 135,   -- copper, vendor price × quantity
+            vendorPrice = 13,    -- copper per unit
+            lowestBuyout = 120,  -- one auction at the lowest unit price:
+            lowestCount = 10,    --   unit price = 120 / 10 = 12c
+            quantity = 45,       -- units listed at that unit price
         },
     },
     scannedAt = 1795000000,      -- time() of the scan the items come from
     auctionCount = 152345,       -- auctions in that scan
+    resultsFormat = 2,           -- saved row format version
     lastScanSeenAt = 1795000000, -- last time this addon saw a scan start (any addon)
     lastRequestAt = 1794990000,  -- last time this addon's Scan button asked for one
 }
 ```
 
-The example values are illustrative. Profit isn't saved. The window works it out as `vendorValue - buyout`.
+The example values are illustrative. Unit buyout and profit aren't saved. The window works them out as `lowestBuyout / lowestCount` and `vendorPrice - unitBuyout`. `resultsFormat` is the row format version, and results in an older format are discarded on load.
 
 ### Events
 - `ADDON_LOADED`: initialize SavedVariables (unregistered after first use)
@@ -210,7 +215,9 @@ The example values are illustrative. Profit isn't saved. The window works it out
 - **Must read while the AH is open.** The scan list is gone once the AH closes, so closing mid-read cancels the scan and keeps the previous results. Item-data loading carries on after closing, since it doesn't need the AH.
 - **Uncached items are held, not dropped.** The vendor price comes from the item cache. Auctions for uncached items are held as `(count, buyout)` pairs. The item data is requested through Blizzard's `Item` mixin, and the auctions are checked when it arrives. Results are saved as soon as reading finishes, and held items join them as they load, for up to 60 seconds.
 - **Results are saved per realm**, because each realm has its own Auction House. Only the grouped below-vendor rows are saved, not raw auctions, which keeps SavedVariables small.
-- **Derived values aren't saved.** Profit and lowercase names are added to fresh list elements in `buildElements`, so SavedVariables only hold scan data.
+- **Lowest price per item, compared exactly.** Each row keeps one auction's `(buyout, count)` at the lowest unit price, plus the units at that price. Unit prices are compared by cross-multiplying (`buyout × lowestCount` vs `lowestBuyout × count`), so stack prices that work out to fractions of a copper compare exactly. Rounding only happens for display.
+- **Names are read with the vendor price.** In 0.1.0 the name was looked up later, when the item's row was created. With 200,000+ auctions read in between, the game could drop the item from its cache, so some rows had no name. Now both come from one `C_Item.GetItemInfo` call. `fillMissingNames` is a safety net that logs a count, which should stay 0.
+- **Derived values aren't saved.** Unit buyout, profit and lowercase names are added to fresh list elements in `buildElements`, so SavedVariables only hold scan data.
 - **The log lives in SavedVariables.** Addons can't write files, so the log is a capped list of lines in its own SavedVariable, written to disk on `/reload` or logout. It's always on, because problems are usually noticed after the fact. `/vsnipe debug` only controls chat output.
 - **Error capture.** Event handlers, timer and item-load callbacks, and the window's handlers run through `ns.SafeCall`, which logs an error and then passes it to the game's error handler, so nothing that BugSack or the default popup would show is hidden. A repeating error is logged in full once, then only on the 2nd, 4th, 8th… time, so it can't push everything else out of the 500-line log. Row hover tooltips aren't wrapped, since they only call Blizzard's tooltip.
 - **Gathercraft is a reference, not a dependency.** Its scan code (GPL-3) was read to confirm which APIs work on Forever. No code was copied, and the addon has no dependency on Gathercraft.
