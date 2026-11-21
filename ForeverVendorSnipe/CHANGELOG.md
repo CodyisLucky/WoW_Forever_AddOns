@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0
+- New **Undercuts** tab: the 200 items whose cheapest auction is furthest below the second cheapest auction, per unit, sorted by the difference. Columns: Item, Lowest, 2nd lowest, Difference.
+- The window now has two tabs along the bottom, **Below Vendor** and **Undercuts**. Search, Scan and the status line are shared, and the window reopens on the last tab used.
+- Random-suffix items ("of the Monkey", "of the Tiger") are now listed separately on both tabs, with the suffix in the name and its stats in the tooltip. Before, all suffixes of an item were merged into one row without the suffix.
+- Search matches the suffix too.
+- Results saved by 0.3.x are discarded once, because the saved format changed. The next scan fills both tabs.
+
 ## 0.3.1
 - Cheaper handling of repeat scan events. The game sends about 96,000 of them per full scan, and each is now dropped with one time comparison instead of a saved-data lookup.
 

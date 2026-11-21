@@ -25,6 +25,8 @@ ns.defaults = {
         x = -40,
         y = -120,
     },
+    -- Results window tab shown on open, by tab id: "vendor" or "undercuts" (ResultsWindow.lua).
+    selectedTab = "vendor",
     -- Scan results and scan timing per realm, keyed by realm name (Scanner.lua).
     realms = {},
 }

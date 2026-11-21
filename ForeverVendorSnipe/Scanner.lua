@@ -1,7 +1,12 @@
 --[[
     Scanner.lua
-    Reads full Auction House scans and keeps, per item, the lowest unit price
-    below what a vendor pays and how many units are listed at that price.
+    Reads full Auction House scans, groups the auctions into item variants, and
+    feeds each auction to the two result builders: BelowVendor.lua (lowest price
+    below vendor) and Undercuts.lua (cheapest vs second cheapest auction).
+
+    A variant is an item ID plus the name shown in the auction's item link, so
+    "Axe of the Monkey" and "Axe of the Bear" are separate even though they share
+    an item ID. Items that stack can't have a suffix, so their link isn't read.
 
     A full scan (C_AuctionHouse.ReplicateItems) can be started by any addon, and
     the server allows one every 15 minutes, shared by all of them. Gathercraft
@@ -13,7 +18,7 @@
       reading  every auction is read in time-limited steps, one step per frame,
                while the Auction House is open (closing it loses the list)
       loading  reading is done and the results are saved, but some items weren't
-               in the item cache yet. Their listings wait until the item data
+               in the item cache yet. Their auctions wait until the item data
                arrives (or ITEM_LOAD_TIMEOUT passes), then join the results.
 ]]
 
@@ -26,6 +31,8 @@ local C_AuctionHouse = C_AuctionHouse
 local C_Item = C_Item
 local debugprofilestop = debugprofilestop
 local pcall = pcall
+local addVendorListing = ns.AddVendorListing
+local addUndercutListing = ns.AddUndercutListing
 
 local SCAN_COOLDOWN = 15 * 60 -- seconds the server waits between full scans
 -- REPLICATE_ITEM_LIST_UPDATE fires 100+ times for a single scan. A new scan can't
@@ -35,9 +42,16 @@ local DUPLICATE_EVENT_WINDOW = 10 * 60
 local READ_BUDGET_MS = 8 -- time spent reading per frame, so the game doesn't freeze
 local SCAN_ANSWER_TIMEOUT = 30 -- seconds to wait for the server after ns.StartScan
 local ITEM_LOAD_TIMEOUT = 60 -- seconds to wait for uncached items before giving up on them
--- Version of the saved row format (see addListing). Saved results in any other format
--- are discarded by getRealmData. 1 (v0.1.0) summed every listing; 2 keeps the lowest price.
-local RESULTS_FORMAT = 2
+-- Version of the saved results format. Saved results in any other format are discarded
+-- by getRealmData. 1 (v0.1.0) summed every listing; 2 kept the lowest price per item ID;
+-- 3 keys rows by variant (item ID + suffix) and adds the undercut list.
+local RESULTS_FORMAT = 3
+-- Captures the name between the brackets of an item link: "|h[Axe of the Monkey]|h".
+local LINK_NAME_PATTERN = "|h%[(.-)%]|h"
+-- Separates the item ID from the suffixed name in a variant key: "4567:Axe of the Monkey".
+local VARIANT_KEY_SEPARATOR = ":"
+-- Values per held auction in scan.held[itemID]: count, buyout, link (or false).
+local HELD_STRIDE = 3
 
 ns.SCAN_STATES = {
     IDLE = "idle",
@@ -47,19 +61,24 @@ ns.SCAN_STATES = {
 }
 local STATES = ns.SCAN_STATES
 
+-- Not part of the documented Mainline API on every client. Looked up once; if it's
+-- missing, links aren't read and suffixed items are grouped by item ID only.
+local getReplicateItemLink = C_AuctionHouse.GetReplicateItemLink
+
 local ahOpen = false
 -- The scan being read or loaded, or nil. Fields:
 --   state         STATES.READING or STATES.LOADING
 --   index, total  next auction to read (0-based) and how many there are
 --   startedAt     time() when reading began, saved as the results' scan time
---   items         results being built: items[itemID] = row (see addListing)
---   vendorPrices  vendorPrices[itemID] = vendor price per unit, for items already looked up
---   names, qualities, stackSizes  the item's name, quality and max stack size, cached in
---                                 the same lookup as its price
---   held          held[itemID] = { count, buyout, count, buyout, ... } for items not cached yet
+--   vendorRows    Below Vendor rows being built: vendorRows[variant.key] = row (BelowVendor.lua)
+--   undercuts     undercut entries being built: undercuts[variant.key] = entry (Undercuts.lua)
+--   itemInfo      itemInfo[itemID] = { name, quality, vendorPrice, bulk } for items already looked up
+--   variants      variants[itemID][name] = variant (see getVariant)
+--   held          held[itemID] = { count, buyout, link, count, buyout, link, ... } for items not cached yet
 --   heldCount     number of item IDs in held
 --   readStartedMs, loadStartedMs  debugprofilestop() when reading / loading began, for the log
 --   bidOnly, unreadable           auctions skipped for having no buyout / failing to read, for the log
+--   emptyLinkNames                links with no name between the brackets, for the log
 local activeScan
 -- REPLICATE_ITEM_LIST_UPDATE events ignored since the Auction House opened. Logged on
 -- close, to check the assumption that one scan sends many repeat events.
@@ -71,9 +90,9 @@ local ignoreEventsUntil = 0
 
 --- Returns this realm's saved scan data, creating it on first use.
 --- Results are kept per realm because each realm has its own Auction House.
---- Results saved in an older row format (resultsFormat ~= RESULTS_FORMAT) are discarded,
+--- Results saved in an older format (resultsFormat ~= RESULTS_FORMAT) are discarded,
 --- since the window can't read them; the scan timing is kept so the cooldown still works.
----@return table realm { items, scannedAt, auctionCount, resultsFormat, lastScanSeenAt, lastRequestAt }
+---@return table realm { items, undercuts, scannedAt, auctionCount, resultsFormat, lastScanSeenAt, lastRequestAt }
 local function getRealmData()
     local realmName = GetRealmName()
     local realm = ns.db.realms[realmName]
@@ -85,7 +104,8 @@ local function getRealmData()
         ns.db.realms[realmName] = realm
     end
     if realm.resultsFormat ~= RESULTS_FORMAT then
-        realm.items = {}           -- items[itemID] = row, see addListing
+        realm.items = {}           -- Below Vendor rows, items[variant.key] = row (BelowVendor.lua)
+        realm.undercuts = {}       -- Undercuts rows, largest gap first (Undercuts.lua)
         realm.scannedAt = 0        -- time() of the scan the results come from
         realm.auctionCount = 0     -- auctions in that scan
         realm.resultsFormat = RESULTS_FORMAT
@@ -105,14 +125,15 @@ local function countKeys(t)
 end
 
 --- Looks up an item's name, quality, vendor price and max stack size from the game's
---- item cache. Returns nils when the item isn't cached yet.
----@param itemID number
+--- item cache. Returns nils when the item isn't cached yet. Takes an item ID or an item
+--- link; with a suffixed item's link, the name includes the suffix.
+---@param item number|string Item ID or item link
 ---@return string|nil name
 ---@return number|nil quality Enum.ItemQuality value
 ---@return number|nil sellPrice Vendor price per unit in copper (0 = can't be sold)
 ---@return number|nil stackSize Most units that fit in one bag slot (1 = doesn't stack)
-local function getItemDetails(itemID)
-    local name, _, quality, _, _, _, _, stackSize, _, _, sellPrice = C_Item.GetItemInfo(itemID)
+local function getItemDetails(item)
+    local name, _, quality, _, _, _, _, stackSize, _, _, sellPrice = C_Item.GetItemInfo(item)
     return name, quality, sellPrice, stackSize
 end
 
@@ -126,91 +147,138 @@ local function isBulkItem(stackSize)
     return (stackSize or 1) > 1
 end
 
---- Returns an item's vendor price per unit, using the scan's cache when possible.
---- The name, quality and stack size are cached from the same lookup. The name used to be
---- looked up again
---- when the item's first row was made, and with 200,000+ auctions read in between, the
---- game could have dropped the item from its cache by then, leaving the name empty.
---- Only known prices are cached, so an uncached item is looked up again next time.
+--- Returns an item's cached details for this scan, looking them up the first time.
+--- Name, quality, vendor price and bulk flag come from one C_Item.GetItemInfo call. The
+--- name used to be looked up separately, later, and with 200,000+ auctions read in
+--- between, the game could have dropped the item from its cache by then, leaving the
+--- name empty. Only found items are cached, so an uncached item is looked up again
+--- next time (callers hold its auctions in the meantime, see holdListing).
 ---@param scan table The active scan
 ---@param itemID number
----@return number|nil price Copper per unit, 0 if it can't be sold, nil if not cached yet
-local function getVendorPrice(scan, itemID)
-    local price = scan.vendorPrices[itemID]
-    if price == nil then
-        local name, quality, stackSize
-        name, quality, price, stackSize = getItemDetails(itemID)
-        if price ~= nil then
-            scan.vendorPrices[itemID] = price
-            scan.names[itemID] = name
-            scan.qualities[itemID] = quality
-            scan.stackSizes[itemID] = stackSize
+---@return table|nil info { name, quality, vendorPrice, bulk }, nil if the item isn't cached yet
+local function getItemInfo(scan, itemID)
+    local info = scan.itemInfo[itemID]
+    if not info then
+        local name, quality, sellPrice, stackSize = getItemDetails(itemID)
+        if sellPrice ~= nil then
+            info = {
+                name = name,
+                quality = quality,
+                vendorPrice = sellPrice,     -- copper per unit, 0 if it can't be sold
+                bulk = isBulkItem(stackSize),
+            }
+            scan.itemInfo[itemID] = info
         end
     end
-    return price
+    return info
 end
 
---- Adds one auction to its item's row if its buyout is below the vendor value.
---- Each item keeps only its lowest unit price and the units listed at exactly that price:
---- a cheaper auction replaces the price and quantity, one at the same price adds its
---- units, and a dearer one is ignored. The price is kept as one auction's (buyout, count)
---- pair, and unit prices are compared by cross-multiplying, so stacks priced in
---- fractions of a copper per unit (e.g. 7 for 1s) compare exactly.
+--- Reads the item link of one auction in the full scan list.
+--- pcall-wrapped like readAuction, since single auctions can fail to read. Returns nil
+--- when the API is missing on this client (see getReplicateItemLink) or the read fails.
+---@param index number 0-based auction index
+---@return string|nil link
+local function readLink(index)
+    if not getReplicateItemLink then
+        return nil
+    end
+    local ok, link = pcall(getReplicateItemLink, index)
+    return ok and link or nil
+end
+
+--- Returns the name shown in an item link, including any suffix ("Axe of the Monkey").
+--- Reads it from between the link's brackets, which costs no API call. If the brackets
+--- are empty (counted in scan.emptyLinkNames for the log), asks C_Item.GetItemInfo
+--- for the link's name instead, which can still be nil.
+---@param scan table The active scan
+---@param link string An item link
+---@return string|nil name
+local function getLinkName(scan, link)
+    local name = link:match(LINK_NAME_PATTERN)
+    if name == nil or name == "" then
+        scan.emptyLinkNames = scan.emptyLinkNames + 1
+        name = C_Item.GetItemInfo(link)
+    end
+    return name
+end
+
+--- Returns the variant an auction belongs to: its item ID plus the name in its link.
+--- Bulk items and auctions without a link use the item's plain name. A variant whose
+--- name matches the plain name is keyed by the item ID; a suffixed one by
+--- "itemID:name" and it keeps the link, so the window can show the suffix's stats.
+--- Variants are cached per scan in a two-level table (item ID, then name), so the
+--- common case costs two lookups and no string building.
 ---@param scan table The active scan
 ---@param itemID number
----@param count number Units in the auction
----@param buyout number Buyout for the whole auction, in copper
----@param unitVendorPrice number Vendor price per unit, in copper (more than 0)
-local function addListing(scan, itemID, count, buyout, unitVendorPrice)
-    if unitVendorPrice * count <= buyout then
-        return
+---@param info table The item's details from getItemInfo
+---@param link string|nil The auction's item link, if it was read
+---@return table variant { key, itemID, name, link, quality, bulk, vendorPrice }
+local function getVariant(scan, itemID, info, link)
+    local name = info.name
+    if link and not info.bulk then
+        name = getLinkName(scan, link) or info.name
     end
 
-    local row = scan.items[itemID]
-    if not row then
-        scan.items[itemID] = {
-            name = scan.names[itemID],
-            quality = scan.qualities[itemID],
-            bulk = isBulkItem(scan.stackSizes[itemID]), -- bought by quantity, not per listing
-            vendorPrice = unitVendorPrice,  -- copper per unit
-            lowestBuyout = buyout,          -- an auction at the lowest unit price:
-            lowestCount = count,            --   unit price = lowestBuyout / lowestCount
-            quantity = count,               -- units listed at that unit price
+    local byName = scan.variants[itemID]
+    if not byName then
+        byName = {}
+        scan.variants[itemID] = byName
+    end
+    local variant = byName[name]
+    if not variant then
+        local suffixed = name ~= info.name
+        variant = {
+            key = suffixed and (itemID .. VARIANT_KEY_SEPARATOR .. name) or itemID,
+            itemID = itemID,
+            name = name,
+            link = suffixed and link or nil,
+            quality = info.quality,
+            bulk = info.bulk,
+            vendorPrice = info.vendorPrice,
         }
-        return
+        byName[name] = variant
     end
-
-    -- Sign of (buyout / count) - (lowestBuyout / lowestCount), without dividing.
-    local difference = buyout * row.lowestCount - row.lowestBuyout * count
-    if difference < 0 then
-        row.lowestBuyout, row.lowestCount, row.quantity = buyout, count, count
-    elseif difference == 0 then
-        row.quantity = row.quantity + count
-    end
+    return variant
 end
 
---- Fills in a row's name, quality and bulk flag once its item data has loaded.
---- The callback for fillMissingNames; tells the window to redraw.
----@param row table A saved result row
+--- Passes one auction of a cached item to both result builders (BelowVendor.lua and
+--- Undercuts.lua), after working out its variant.
+---@param scan table The active scan
 ---@param itemID number
-local function fillName(row, itemID)
-    local name, quality, _, stackSize = getItemDetails(itemID)
-    row.name, row.quality = name, quality or row.quality
+---@param info table The item's details from getItemInfo
+---@param count number Units in the auction
+---@param buyout number Buyout for the whole auction, in copper
+---@param link string|nil The auction's item link, if it was read
+local function addAuction(scan, itemID, info, count, buyout, link)
+    local variant = getVariant(scan, itemID, info, link)
+    addVendorListing(scan.vendorRows, variant, count, buyout)
+    addUndercutListing(scan.undercuts, variant, count, buyout)
+end
+
+--- Fills in a saved row's name, quality and bulk flag once its item data has loaded.
+--- Suffixed rows look the name up by their link, so the suffix is kept.
+--- The callback for fillMissingNames; tells the window to redraw.
+---@param row table A saved result row (Below Vendor or Undercuts)
+local function fillName(row)
+    local _, quality, _, stackSize = getItemDetails(row.itemID)
+    row.name = getItemDetails(row.link or row.itemID)
+    row.quality = quality or row.quality
     row.bulk = isBulkItem(stackSize)
     ns.OnScanUpdated()
 end
 
 --- Safety net for rows saved without a name: requests each missing item's data and
 --- fills the name in when it arrives (fillName). Logs how many were missing, which
---- should be 0 now that names are cached with the vendor price (see getVendorPrice).
----@param items table A realm's saved rows, items[itemID] = row
-local function fillMissingNames(items)
+--- should be 0 now that names are cached with the vendor price (see getItemInfo).
+--- Works on both saved row sets, since they share itemID, link and name fields.
+---@param rows table Saved rows (a map or an array)
+local function fillMissingNames(rows)
     local missing = 0
-    for itemID, row in pairs(items) do
+    for _, row in pairs(rows) do
         if not row.name then
             missing = missing + 1
-            Item:CreateFromItemID(itemID):ContinueOnItemLoad(function()
-                ns.SafeCall(fillName, row, itemID)
+            Item:CreateFromItemID(row.itemID):ContinueOnItemLoad(function()
+                ns.SafeCall(fillName, row)
             end)
         end
     end
@@ -219,30 +287,46 @@ local function fillMissingNames(items)
     end
 end
 
+--- Saves the scan's results as this realm's current results.
+--- The Below Vendor rows are saved as the live table, so held items that load later
+--- show up straight away. The undercut list is a pick from all entries
+--- (ns.PickTopUndercuts), so it's saved again when loading ends (finishLoading).
+---@param scan table The scan whose results to save
+local function saveResults(scan)
+    local realm = getRealmData()
+    realm.items = scan.vendorRows
+    realm.undercuts = ns.PickTopUndercuts(scan.undercuts)
+    realm.scannedAt = scan.startedAt
+    realm.auctionCount = scan.total
+end
+
 --- Marks the scan as finished: fills in any missing names and tells the window.
 --- Called when reading ends with nothing held, or when loading ends.
 ---@param scan table The scan that just finished
 local function endScan(scan)
     activeScan = nil
-    fillMissingNames(scan.items)
+    fillMissingNames(scan.vendorRows)
+    fillMissingNames(getRealmData().undercuts)
     ns.OnScanUpdated()
 end
 
 --- Ends the loading phase: the scan is done, and any items that never loaded are dropped.
 --- Called when the last held item resolves, or by the ITEM_LOAD_TIMEOUT timer.
---- Logs how long loading took and how many items never arrived, then ends the scan.
+--- Saves the results again so the undercut pick includes the items that loaded, logs
+--- how long loading took and how many items never arrived, then ends the scan.
 ---@param scan table The scan being finished
 local function finishLoading(scan)
+    saveResults(scan)
     ns.Debug(("Item data loading finished after %.1f s; %d items never loaded and were skipped."):format(
         (debugprofilestop() - scan.loadStartedMs) / 1000, scan.heldCount))
     endScan(scan)
 end
 
---- Checks an item's held listings once its data has loaded, then forgets them.
+--- Adds an item's held auctions to the results once its data has loaded, then forgets them.
 --- Ignored if a newer scan has replaced this one. While loading, the window is told
 --- to refresh, and the scan finishes when this was the last held item. During reading
 --- the results aren't shown yet, so finishReading does that instead.
----@param scan table The scan that held the listings
+---@param scan table The scan that held the auctions
 ---@param itemID number
 local function resolveHeldListings(scan, itemID)
     local held = scan.held[itemID]
@@ -252,10 +336,11 @@ local function resolveHeldListings(scan, itemID)
     scan.held[itemID] = nil
     scan.heldCount = scan.heldCount - 1
 
-    local unitPrice = getVendorPrice(scan, itemID)
-    if unitPrice and unitPrice > 0 then
-        for i = 1, #held, 2 do
-            addListing(scan, itemID, held[i], held[i + 1], unitPrice)
+    local info = getItemInfo(scan, itemID)
+    if info then
+        for i = 1, #held, HELD_STRIDE do
+            -- A missing link is stored as false (nil would end the array); pass nil on.
+            addAuction(scan, itemID, info, held[i], held[i + 1], held[i + 2] or nil)
         end
     end
 
@@ -267,7 +352,7 @@ local function resolveHeldListings(scan, itemID)
     end
 end
 
---- Keeps an auction for an item that isn't in the item cache yet, so it can be checked later.
+--- Keeps an auction for an item that isn't in the item cache yet, so it can be added later.
 --- The first auction held for an item also asks the game to load it, using Blizzard's
 --- Item mixin, which calls back when the data arrives. The auction is stored before
 --- the request, in case the callback runs straight away. The callback runs through
@@ -276,7 +361,8 @@ end
 ---@param itemID number
 ---@param count number
 ---@param buyout number
-local function holdListing(scan, itemID, count, buyout)
+---@param link string|nil The auction's item link, kept so its suffix isn't lost
+local function holdListing(scan, itemID, count, buyout, link)
     local held = scan.held[itemID]
     local isNew = not held
     if isNew then
@@ -286,6 +372,7 @@ local function holdListing(scan, itemID, count, buyout)
     end
     held[#held + 1] = count
     held[#held + 1] = buyout
+    held[#held + 1] = link or false
 
     if isNew then
         Item:CreateFromItemID(itemID):ContinueOnItemLoad(function()
@@ -294,22 +381,26 @@ local function holdListing(scan, itemID, count, buyout)
     end
 end
 
---- Sorts one auction: below-vendor listings join the results, uncached items are held.
---- Items already being held skip the lookup, so only one load is requested per item.
+--- Sorts one auction: cached items go to the results, uncached items are held.
+--- The link is only read when the item might have a suffix: when it isn't known to be
+--- a bulk (stacking) item. Items already being held skip the cache lookup, so only one
+--- load is requested per item.
 ---@param scan table The active scan
+---@param index number 0-based auction index, for reading the link
 ---@param itemID number
 ---@param count number
 ---@param buyout number
-local function considerAuction(scan, itemID, count, buyout)
+local function considerAuction(scan, index, itemID, count, buyout)
     if scan.held[itemID] then
-        holdListing(scan, itemID, count, buyout)
+        holdListing(scan, itemID, count, buyout, readLink(index))
         return
     end
-    local unitPrice = getVendorPrice(scan, itemID)
-    if unitPrice == nil then
-        holdListing(scan, itemID, count, buyout)
-    elseif unitPrice > 0 then
-        addListing(scan, itemID, count, buyout, unitPrice)
+    local info = getItemInfo(scan, itemID)
+    local link = not (info and info.bulk) and readLink(index) or nil
+    if info then
+        addAuction(scan, itemID, info, count, buyout, link)
+    else
+        holdListing(scan, itemID, count, buyout, link)
     end
 end
 
@@ -336,18 +427,15 @@ local function readAuction(index)
 end
 
 --- Saves the results once every auction is read, then waits for held items if there are any.
---- Replaces this realm's saved results with the new scan and logs a summary (time taken,
---- skipped auctions, items found). The scan stays active in the loading state while
---- items are held, and the window is told to refresh either way.
+--- Replaces this realm's saved results with the new scan (saveResults) and logs a summary
+--- (time taken, skipped auctions, variants and items found). The scan stays active in the
+--- loading state while items are held, and the window is told to refresh either way.
 ---@param scan table The scan that just finished reading
 local function finishReading(scan)
-    local realm = getRealmData()
-    realm.items = scan.items
-    realm.scannedAt = scan.startedAt
-    realm.auctionCount = scan.total
-    ns.Debug(("Read %d auctions in %.1f s: %d bid-only skipped, %d unreadable, %d items below vendor so far, %d items waiting for item data."):format(
+    saveResults(scan)
+    ns.Debug(("Read %d auctions in %.1f s: %d bid-only skipped, %d unreadable, %d variants, %d below vendor, %d items waiting for item data, %d links without a name."):format(
         scan.total, (debugprofilestop() - scan.readStartedMs) / 1000, scan.bidOnly, scan.unreadable,
-        countKeys(scan.items), scan.heldCount))
+        countKeys(scan.undercuts), countKeys(scan.vendorRows), scan.heldCount, scan.emptyLinkNames))
 
     if scan.heldCount > 0 then
         scan.state = STATES.LOADING
@@ -381,7 +469,7 @@ local function readStep(scan)
         elseif not (buyout and buyout > 0) then
             scan.bidOnly = scan.bidOnly + 1
         elseif count and count > 0 then
-            considerAuction(scan, itemID, count, buyout)
+            considerAuction(scan, index, itemID, count, buyout)
         end
         index = index + 1
     end
@@ -398,6 +486,7 @@ end
 
 --- Starts reading a full scan list that the server has just sent.
 --- Replaces any scan still in the loading state; its pending callbacks are then ignored.
+--- Logs once per scan if the item-link API is missing (suffixes can't be told apart).
 ---@param total number Auctions in the list, from GetNumReplicateItems
 local function startReading(total)
     local scan = {
@@ -405,19 +494,22 @@ local function startReading(total)
         index = 0,
         total = total,
         startedAt = time(),
-        items = {},
-        vendorPrices = {},
-        names = {},
-        qualities = {},
-        stackSizes = {},
+        vendorRows = {},
+        undercuts = {},
+        itemInfo = {},
+        variants = {},
         held = {},
         heldCount = 0,
         readStartedMs = debugprofilestop(),
         bidOnly = 0,
         unreadable = 0,
+        emptyLinkNames = 0,
     }
     activeScan = scan
     ns.Debug(("Reading full scan: %d auctions."):format(total))
+    if not getReplicateItemLink then
+        ns.Debug("C_AuctionHouse.GetReplicateItemLink is missing; suffixed items are grouped by item ID.")
+    end
     ns.OnScanUpdated()
     readStep(scan)
 end
@@ -488,13 +580,24 @@ local function isAwaitingAnswer(realm)
         and time() - realm.lastRequestAt < SCAN_ANSWER_TIMEOUT
 end
 
---- Returns the current saved results for this realm.
----@return table items items[itemID] = { name, quality, bulk, vendorPrice, lowestBuyout, lowestCount, quantity }
+--- Returns the saved Below Vendor rows for this realm.
+---@return table rows rows[variant.key] = { itemID, name, link, quality, bulk, vendorPrice, lowestBuyout, lowestCount, quantity }
+function ns.GetVendorRows()
+    return getRealmData().items
+end
+
+--- Returns the saved Undercuts rows for this realm.
+---@return table rows Array, largest gap first: { itemID, name, link, quality, bulk, lowestBuyout, lowestCount, secondBuyout, secondCount }
+function ns.GetUndercutRows()
+    return getRealmData().undercuts
+end
+
+--- Returns when the saved results were scanned and how many auctions the scan had.
 ---@return number scannedAt time() of the scan, 0 if there has been none
 ---@return number auctionCount Auctions in that scan
-function ns.GetResults()
+function ns.GetScanInfo()
     local realm = getRealmData()
-    return realm.items, realm.scannedAt, realm.auctionCount
+    return realm.scannedAt, realm.auctionCount
 end
 
 --- Returns what the scanner is doing right now, for the window's status line.

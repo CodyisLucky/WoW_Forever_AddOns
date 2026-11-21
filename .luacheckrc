@@ -14,6 +14,13 @@ read_globals = {
     "UIParent",
     "UISpecialFrames",
 
+    -- Tabs and sounds
+    "PanelTemplates_SetNumTabs",
+    "PanelTemplates_SetTab",
+    "PanelTemplates_TabResize",
+    "PlaySound",
+    "SOUNDKIT",
+
     -- Scroll lists
     "CreateDataProvider",
     "CreateScrollBoxListLinearView",

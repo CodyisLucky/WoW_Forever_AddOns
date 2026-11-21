@@ -1,8 +1,8 @@
 ## Interface: 16001
 ## Title: Forever Vendor Snipe
-## Notes: Lists Auction House items selling for less than their vendor price, ranked by profit.
+## Notes: Lists Auction House items selling for less than their vendor price, and items whose cheapest auction undercuts the next one by the most.
 ## Author: Cody
-## Version: 0.3.1
+## Version: 0.4.0
 ## Category: Auction
 ## IconTexture: Interface\Icons\INV_Misc_Coin_02
 ## SavedVariables: ForeverVendorSnipeDB, ForeverVendorSnipeLog
@@ -11,5 +11,7 @@ Locales\enUS.lua
 Utils.lua
 Log.lua
 ForeverVendorSnipe.lua
+BelowVendor.lua
+Undercuts.lua
 Scanner.lua
 ResultsWindow.lua

@@ -1,15 +1,21 @@
 --[[
     ResultsWindow.lua
-    The movable results window: a search box, a status line, the fallback Scan
-    button, sortable column headers and a scrolling list with one row per item.
-    Prices are per unit: the item's lowest below-vendor buyout, its vendor price,
-    and the profit on each unit bought at that price.
+    The movable results window: a search box, a status line and the fallback Scan
+    button at the top, and two tabs at the bottom, each with its own page of
+    sortable column headers and a scrolling list.
+      Below Vendor  each variant's lowest below-vendor price, its vendor price, and
+                    the profit on each unit bought at that price
+      Undercuts     the variants whose cheapest auction is furthest below the
+                    second cheapest, per unit
+    Search, Scan and the status line are shared by both tabs. The selected tab is
+    saved (ns.db.selectedTab); each tab keeps its own sort while the game runs.
     Opens when the Auction House opens, closes when it closes, and /vsnipe toggles
     it at any time to show the last saved scan.
 
     The window is created the first time it's shown (after ADDON_LOADED, so ns.db
-    exists). It reads everything from Scanner.lua (ns.GetResults, ns.GetScanStatus,
-    ns.GetScanCooldown) and never changes scan data.
+    exists). It reads everything from Scanner.lua (ns.GetVendorRows,
+    ns.GetUndercutRows, ns.GetScanInfo, ns.GetScanStatus, ns.GetScanCooldown) and
+    never changes scan data.
 ]]
 
 local _, ns = ...
@@ -43,6 +49,12 @@ local SORT_ARROW_HEIGHT = 8
 local SORT_ARROW_GAP = 2
 local SORT_ARROW_TEXTURE = "Interface\\Buttons\\UI-SortArrow"
 local ROW_HIGHLIGHT_TEXTURE = "Interface\\QuestFrame\\UI-QuestTitleHighlight"
+-- Tabs hang off the window's bottom edge, like Blizzard's Character and AH frames.
+local TAB_TEMPLATE = "PanelTabButtonTemplate"
+local TAB_OFFSET_X = 11 -- first tab, from the window's bottom-left corner
+local TAB_OFFSET_Y = 2  -- tabs overlap the window border slightly
+local TAB_GAP = 3       -- between neighboring tabs
+local TAB_TEXT_PADDING = 0 -- extra width passed to PanelTemplates_TabResize
 local STATUS_UPDATE_INTERVAL = 1 -- seconds, keeps "X min ago" and the cooldown current
 local REFRESH_DELAY = 0.2 -- seconds, batches many scan updates into one redraw
 local DEFAULT_QUALITY = Enum.ItemQuality.Common
@@ -52,34 +64,10 @@ local SECONDS_PER_MINUTE = 60
 local SECONDS_PER_HOUR = 60 * 60
 local SECONDS_PER_DAY = 24 * 60 * 60
 
--- Columns, left to right. key is the field on a list element (see buildElements).
--- ascendingFirst: the first click sorts A-Z / low-high instead of high-low.
-local COLUMNS = {
-    { key = "name", label = L.COL_ITEM, width = 250, justify = "LEFT", ascendingFirst = true },
-    { key = "quantity", label = L.COL_QUANTITY, width = 70, justify = "RIGHT" },
-    { key = "unitBuyout", label = L.COL_BUYOUT, width = 100, justify = "RIGHT" },
-    { key = "vendorPrice", label = L.COL_VENDOR, width = 100, justify = "RIGHT" },
-    { key = "profit", label = L.COL_PROFIT, width = 100, justify = "RIGHT" },
-}
-
--- Default sort: highest profit per unit first (ties: lowest buyout, see compareDefault).
-local DEFAULT_SORT_KEY = "profit"
-local sortKey = DEFAULT_SORT_KEY
-local sortAscending = false
-
 local window -- created by getWindow on first show
+local activeTab -- the entry from TABS whose page is showing, set by selectTab
+local sortingTab -- the tab whose list table.sort is ordering, read by compareElements
 local refreshPending = false
-
---- Gives each column its x position inside a row, from the column widths and CELL_GAP.
---- Called once at load. Headers and row cells both use column.offset, so they line up.
-local function computeColumnOffsets()
-    local x = 0
-    for _, column in ipairs(COLUMNS) do
-        column.offset = x
-        x = x + column.width + CELL_GAP
-    end
-end
-computeColumnOffsets()
 
 --- Formats how long ago something happened, e.g. "12 min ago".
 ---@param seconds number Elapsed time in seconds
@@ -104,80 +92,209 @@ local function formatMoney(copper)
     return GetMoneyString(math.floor(copper + 0.5), true)
 end
 
---- The default ordering: highest profit per unit, then lowest unit buyout ("what costs
---- the least"), then name and item ID so the order is always the same.
+--- Formats a unit count with thousands separators, e.g. 12345 -> "12,345".
+---@param count number
+---@return string
+local function formatQuantity(count)
+    return BreakUpLargeNumbers(count)
+end
+
+-- Columns per tab, left to right. key is the field on a list element (see the tab's
+-- makeElement), format turns that field into the cell's text (the Item column is
+-- filled by setNameCell instead). ascendingFirst: the first click sorts A-Z / low-high
+-- instead of high-low.
+local VENDOR_COLUMNS = {
+    { key = "name", label = L.COL_ITEM, width = 250, justify = "LEFT", ascendingFirst = true },
+    { key = "quantity", label = L.COL_QUANTITY, width = 70, justify = "RIGHT", format = formatQuantity },
+    { key = "unitBuyout", label = L.COL_BUYOUT, width = 100, justify = "RIGHT", format = formatMoney },
+    { key = "vendorPrice", label = L.COL_VENDOR, width = 100, justify = "RIGHT", format = formatMoney },
+    { key = "profit", label = L.COL_PROFIT, width = 100, justify = "RIGHT", format = formatMoney },
+}
+
+local UNDERCUT_COLUMNS = {
+    { key = "name", label = L.COL_ITEM, width = 290, justify = "LEFT", ascendingFirst = true },
+    { key = "unitLowest", label = L.COL_LOWEST, width = 100, justify = "RIGHT", format = formatMoney },
+    { key = "unitSecond", label = L.COL_SECOND, width = 100, justify = "RIGHT", format = formatMoney },
+    { key = "difference", label = L.COL_DIFFERENCE, width = 100, justify = "RIGHT", format = formatMoney },
+}
+
+--- Gives each column its x position inside a row, from the column widths and CELL_GAP.
+--- Called once per column set at load. Headers and row cells both use column.offset,
+--- so they line up.
+---@param columns table VENDOR_COLUMNS or UNDERCUT_COLUMNS
+local function computeColumnOffsets(columns)
+    local x = 0
+    for _, column in ipairs(columns) do
+        column.offset = x
+        x = x + column.width + CELL_GAP
+    end
+end
+computeColumnOffsets(VENDOR_COLUMNS)
+computeColumnOffsets(UNDERCUT_COLUMNS)
+
+--- The last tie-breakers for both tabs: name (case-insensitive), then item ID, so the
+--- order is always the same. Two variants of one item differ by name, so they never
+--- reach the item ID check.
 ---@return boolean aFirst Whether element a sorts before element b
-local function compareDefault(a, b)
-    if a.profit ~= b.profit then
-        return a.profit > b.profit
-    elseif a.unitBuyout ~= b.unitBuyout then
-        return a.unitBuyout < b.unitBuyout
-    elseif a.sortName ~= b.sortName then
+local function compareByName(a, b)
+    if a.sortName ~= b.sortName then
         return a.sortName < b.sortName
     end
     return a.itemID < b.itemID
 end
 
---- Orders two list elements by the clicked column, falling back to compareDefault on ties.
---- The Item column compares lowercase names, so sorting ignores case.
+--- Below Vendor's default order: highest profit per unit, then lowest unit buyout
+--- ("what costs the least"), then compareByName.
+---@return boolean aFirst Whether element a sorts before element b
+local function compareVendorDefault(a, b)
+    if a.profit ~= b.profit then
+        return a.profit > b.profit
+    elseif a.unitBuyout ~= b.unitBuyout then
+        return a.unitBuyout < b.unitBuyout
+    end
+    return compareByName(a, b)
+end
+
+--- Undercuts' default order: largest gap per unit, then lowest unit price, then
+--- compareByName.
+---@return boolean aFirst Whether element a sorts before element b
+local function compareUndercutDefault(a, b)
+    if a.difference ~= b.difference then
+        return a.difference > b.difference
+    elseif a.unitLowest ~= b.unitLowest then
+        return a.unitLowest < b.unitLowest
+    end
+    return compareByName(a, b)
+end
+
+--- Builds a Below Vendor list element's columns from a saved row: units at the lowest
+--- price, unit buyout, vendor price and profit per unit. Derived values are worked out
+--- here so they never end up in SavedVariables.
+---@param row table A saved Below Vendor row
+---@return table element The tab-specific fields (buildElements adds the shared ones)
+local function makeVendorElement(row)
+    local unitBuyout = row.lowestBuyout / row.lowestCount
+    return {
+        quantity = row.quantity,
+        unitBuyout = unitBuyout,
+        vendorPrice = row.vendorPrice,
+        profit = row.vendorPrice - unitBuyout,
+    }
+end
+
+--- Builds an Undercuts list element's columns from a saved row, using the same
+--- ns.GetUndercutPrices that ranked the rows, so the numbers always agree.
+---@param row table A saved Undercuts row (always has a second auction)
+---@return table element The tab-specific fields (buildElements adds the shared ones)
+local function makeUndercutElement(row)
+    local unitLowest, unitSecond, difference = ns.GetUndercutPrices(row)
+    return {
+        unitLowest = unitLowest,
+        unitSecond = unitSecond,
+        difference = difference,
+    }
+end
+
+-- The tabs, in display order. Fields:
+--   id              saved in ns.db.selectedTab
+--   label           tab button text
+--   columns         the page's columns (see VENDOR_COLUMNS)
+--   defaultSortKey  column sorted by when the game starts
+--   getRows         returns the saved rows to show (from Scanner.lua)
+--   makeElement     builds a row's tab-specific element fields
+--   compareDefault  the default order, also the tie-breaker for every column
+--   emptyText       shown when the last scan found nothing for this tab
+-- createPage adds the runtime fields: sortKey, sortAscending, page, headers,
+-- scrollBox, emptyTextFrame.
+local TABS = {
+    {
+        id = "vendor",
+        label = L.TAB_VENDOR,
+        columns = VENDOR_COLUMNS,
+        defaultSortKey = "profit",
+        getRows = ns.GetVendorRows,
+        makeElement = makeVendorElement,
+        compareDefault = compareVendorDefault,
+        emptyText = L.EMPTY_LIST,
+    },
+    {
+        id = "undercuts",
+        label = L.TAB_UNDERCUTS,
+        columns = UNDERCUT_COLUMNS,
+        defaultSortKey = "difference",
+        getRows = ns.GetUndercutRows,
+        makeElement = makeUndercutElement,
+        compareDefault = compareUndercutDefault,
+        emptyText = L.EMPTY_UNDERCUTS,
+    },
+}
+
+--- Orders two list elements by sortingTab's clicked column, falling back to the tab's
+--- default order on ties. The Item column compares lowercase names, so sorting ignores
+--- case. table.sort can't pass the tab, so buildElements sets sortingTab first.
 ---@return boolean aFirst Whether element a sorts before element b
 local function compareElements(a, b)
-    local key = sortKey == "name" and "sortName" or sortKey
+    local tab = sortingTab
+    local key = tab.sortKey == "name" and "sortName" or tab.sortKey
     local valueA, valueB = a[key], b[key]
     if valueA ~= valueB then
-        if sortAscending then
+        if tab.sortAscending then
             return valueA < valueB
         end
         return valueA > valueB
     end
-    return compareDefault(a, b)
+    return tab.compareDefault(a, b)
 end
 
---- Builds the sorted list shown in the window from the saved results and the search text.
---- Copies each saved row into a new element with its derived fields (unit buyout,
---- profit per unit, lowercase name), so nothing derived ends up in SavedVariables.
---- The search is a plain, case-insensitive substring match on the item name.
+--- Builds the sorted list for a tab from its saved rows and the search text.
+--- Each row becomes a new element: the tab's own columns (makeElement) plus the fields
+--- every tab shares (item ID, name, lowercase name, link, quality, bulk flag), so
+--- nothing derived ends up in SavedVariables. The search is a plain, case-insensitive
+--- substring match on the item name, which includes any suffix.
+---@param tab table An entry from TABS
 ---@return table elements Sorted list elements
----@return boolean hasResults Whether the last scan found anything, before the search filter
-local function buildElements()
-    local items = ns.GetResults()
+---@return boolean hasResults Whether the last scan found anything for this tab, before the search filter
+local function buildElements(tab)
+    local rows = tab.getRows()
     local query = strtrim(window.searchBox:GetText()):lower()
     local elements = {}
-    for itemID, row in pairs(items) do
+    for _, row in pairs(rows) do
         local sortName = (row.name or ""):lower()
         if query == "" or sortName:find(query, 1, true) then
-            local unitBuyout = row.lowestBuyout / row.lowestCount
-            elements[#elements + 1] = {
-                itemID = itemID,
-                name = row.name,
-                sortName = sortName,
-                quality = row.quality,
-                bulk = row.bulk,
-                quantity = row.quantity,
-                unitBuyout = unitBuyout,
-                vendorPrice = row.vendorPrice,
-                profit = row.vendorPrice - unitBuyout,
-            }
+            local element = tab.makeElement(row)
+            element.itemID = row.itemID
+            element.name = row.name
+            element.sortName = sortName
+            element.link = row.link
+            element.quality = row.quality
+            element.bulk = row.bulk
+            elements[#elements + 1] = element
         end
     end
+    sortingTab = tab
     table.sort(elements, compareElements)
-    return elements, next(items) ~= nil
+    return elements, next(rows) ~= nil
 end
 
---- Rebuilds the list from the current results, search and sort, keeping the scroll position.
---- Shows a message over the empty list: "no matches" when the search hid everything,
---- "nothing below vendor" after a scan that found nothing. With no scan at all, the
---- status line already says so.
+--- Rebuilds the showing tab's list from the current results, search and sort, keeping
+--- the scroll position. Shows a message over the empty list: "no matches" when the
+--- search hid everything, the tab's emptyText after a scan that found nothing. With no
+--- scan at all, the status line already says so. Does nothing before the first tab is
+--- selected (the search box can report a change while the window is being built).
 local function refreshList()
-    local elements, hasResults = buildElements()
-    window.scrollBox:SetDataProvider(CreateDataProvider(elements), ScrollBoxConstants.RetainScrollPosition)
+    local tab = activeTab
+    if not tab then
+        return
+    end
+    local elements, hasResults = buildElements(tab)
+    tab.scrollBox:SetDataProvider(CreateDataProvider(elements), ScrollBoxConstants.RetainScrollPosition)
 
-    local _, scannedAt = ns.GetResults()
+    local scannedAt = ns.GetScanInfo()
     if #elements > 0 or (not hasResults and scannedAt == 0) then
-        window.emptyText:Hide()
+        tab.emptyTextFrame:Hide()
     else
-        window.emptyText:SetText(hasResults and L.EMPTY_SEARCH or L.EMPTY_LIST)
-        window.emptyText:Show()
+        tab.emptyTextFrame:SetText(hasResults and L.EMPTY_SEARCH or tab.emptyText)
+        tab.emptyTextFrame:Show()
     end
 end
 
@@ -204,7 +321,7 @@ end
 --- Runs every STATUS_UPDATE_INTERVAL while the window is shown, and after scan updates.
 local function updateStatus()
     local state, progress, loadingCount = ns.GetScanStatus()
-    local _, scannedAt, auctionCount = ns.GetResults()
+    local scannedAt, auctionCount = ns.GetScanInfo()
     local text
     if state == ns.SCAN_STATES.READING then
         text = L.STATUS_READING:format(math.floor(progress * 100))
@@ -222,11 +339,16 @@ local function updateStatus()
     updateScanButton(state)
 end
 
---- Shows the item's tooltip while the mouse is over a row.
+--- Shows the item's tooltip while the mouse is over a row. Suffixed variants have a
+--- link, which shows the suffix's stats; other rows show the item by ID.
 ---@param row Button The list row
 local function onRowEnter(row)
     GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
-    GameTooltip:SetItemByID(row.itemID)
+    if row.link then
+        GameTooltip:SetHyperlink(row.link)
+    else
+        GameTooltip:SetItemByID(row.itemID)
+    end
     GameTooltip:Show()
 end
 
@@ -238,14 +360,15 @@ end
 --- Creates a row's icon and one text cell per column. Runs once per row frame;
 --- the scroll box reuses row frames, so initRow only fills them in afterwards.
 ---@param row Button A row frame created by the scroll box
-local function createRowRegions(row)
+---@param columns table The page's columns
+local function createRowRegions(row, columns)
     row:SetHighlightTexture(ROW_HIGHLIGHT_TEXTURE, "ADD")
     row.icon = row:CreateTexture(nil, "ARTWORK")
     row.icon:SetSize(ICON_SIZE, ICON_SIZE)
     row.icon:SetPoint("LEFT", row, "LEFT", 0, 0)
 
     row.cells = {}
-    for _, column in ipairs(COLUMNS) do
+    for _, column in ipairs(columns) do
         local left, width = column.offset, column.width
         -- The Item column starts with the icon, so its text begins after it.
         if column.key == "name" then
@@ -263,20 +386,12 @@ local function createRowRegions(row)
     row:SetScript("OnLeave", hideTooltip)
 end
 
---- Fills a row with one list element: icon, name, units at the lowest price, and the
---- three per-unit money columns. The name is light blue (BULK_NAME_COLOR) for items
---- bought in bulk, otherwise its quality color. Rows saved before 0.3.0 have no bulk
---- flag and keep the quality color until the next scan.
---- The scroll box calls this whenever a row frame is shown for an element.
+--- Fills a row's icon and Item cell. The name is light blue (BULK_NAME_COLOR) for items
+--- bought in bulk, otherwise its quality color.
 ---@param row Button The row frame
 ---@param element table A list element from buildElements
-local function initRow(row, element)
-    if not row.cells then
-        createRowRegions(row)
-    end
-    row.itemID = element.itemID
+local function setNameCell(row, element)
     row.icon:SetTexture(C_Item.GetItemIconByID(element.itemID))
-
     local r, g, b
     if element.bulk then
         r, g, b = BULK_NAME_COLOR.r, BULK_NAME_COLOR.g, BULK_NAME_COLOR.b
@@ -285,20 +400,36 @@ local function initRow(row, element)
     end
     row.cells.name:SetText(element.name)
     row.cells.name:SetTextColor(r, g, b)
-
-    row.cells.quantity:SetText(BreakUpLargeNumbers(element.quantity))
-    row.cells.unitBuyout:SetText(formatMoney(element.unitBuyout))
-    row.cells.vendorPrice:SetText(formatMoney(element.vendorPrice))
-    row.cells.profit:SetText(formatMoney(element.profit))
 end
 
---- Shows the sort arrow on the sorted column only, pointing up for ascending.
+--- Fills a row with one list element: icon and name (setNameCell), then every other
+--- column through its format function. Remembers the item ID and link for the tooltip.
+--- The scroll box calls this (through createPage's initializer) whenever a row frame
+--- is shown for an element.
+---@param row Button The row frame
+---@param element table A list element from buildElements
+---@param columns table The page's columns
+local function initRow(row, element, columns)
+    if not row.cells then
+        createRowRegions(row, columns)
+    end
+    row.itemID, row.link = element.itemID, element.link
+    setNameCell(row, element)
+    for _, column in ipairs(columns) do
+        if column.format then
+            row.cells[column.key]:SetText(column.format(element[column.key]))
+        end
+    end
+end
+
+--- Shows the sort arrow on a tab's sorted column only, pointing up for ascending.
 --- The arrow sits just past the label text: right of it for left-aligned columns,
 --- left of it for right-aligned ones.
-local function updateHeaders()
-    for _, header in ipairs(window.headers) do
+---@param tab table An entry from TABS
+local function updateHeaders(tab)
+    for _, header in ipairs(tab.headers) do
         local arrow = header.arrow
-        if header.column.key == sortKey then
+        if header.column.key == tab.sortKey then
             local textOffset = header.label:GetStringWidth() + SORT_ARROW_GAP
             arrow:ClearAllPoints()
             if header.column.justify == "LEFT" then
@@ -306,7 +437,7 @@ local function updateHeaders()
             else
                 arrow:SetPoint("RIGHT", header, "RIGHT", -textOffset, 0)
             end
-            if sortAscending then
+            if tab.sortAscending then
                 arrow:SetTexCoord(0, 0.5625, 0, 1)
             else
                 arrow:SetTexCoord(0, 0.5625, 1, 0)
@@ -318,26 +449,28 @@ local function updateHeaders()
     end
 end
 
---- Sorts by a column when its header is clicked. Clicking the sorted column again
+--- Sorts a tab by a column when its header is clicked. Clicking the sorted column again
 --- reverses the order; a new column starts in its natural direction (ascendingFirst).
----@param column table The clicked entry from COLUMNS
-local function onHeaderClick(column)
-    if sortKey == column.key then
-        sortAscending = not sortAscending
+---@param tab table The entry from TABS the header belongs to
+---@param column table The clicked column
+local function onHeaderClick(tab, column)
+    if tab.sortKey == column.key then
+        tab.sortAscending = not tab.sortAscending
     else
-        sortKey = column.key
-        sortAscending = column.ascendingFirst == true
+        tab.sortKey = column.key
+        tab.sortAscending = column.ascendingFirst == true
     end
-    updateHeaders()
+    updateHeaders(tab)
     refreshList()
 end
 
 --- Creates one clickable column header with its label and (hidden) sort arrow.
 --- Clicks run through ns.SafeCall, so errors are logged.
----@param parent Frame The window
----@param column table An entry from COLUMNS
+---@param parent Frame The tab's page
+---@param tab table The entry from TABS
+---@param column table One of the tab's columns
 ---@return Button header
-local function createHeader(parent, column)
+local function createHeader(parent, tab, column)
     local header = CreateFrame("Button", nil, parent)
     header:SetSize(column.width, HEADER_HEIGHT)
     header:SetPoint("TOPLEFT", parent, "TOPLEFT", PADDING + column.offset, HEADER_OFFSET_Y)
@@ -354,7 +487,7 @@ local function createHeader(parent, column)
     header.arrow:Hide()
 
     header:SetScript("OnClick", function()
-        ns.SafeCall(onHeaderClick, column)
+        ns.SafeCall(onHeaderClick, tab, column)
     end)
     return header
 end
@@ -375,9 +508,9 @@ local function onScanButtonClick()
 end
 
 --- Creates the title, search box, Scan button and status line at the top of the window.
---- Typing in the search box refreshes the list (through ns.SafeCall, so errors are
---- logged). HookScript keeps the template's own OnTextChanged, which shows and hides
---- the "Search" placeholder.
+--- These are shared by both tabs. Typing in the search box refreshes the showing tab's
+--- list (through ns.SafeCall, so errors are logged). HookScript keeps the template's
+--- own OnTextChanged, which shows and hides the "Search" placeholder.
 ---@param frame Frame The window
 local function createToolbar(frame)
     local title = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
@@ -405,32 +538,106 @@ local function createToolbar(frame)
     frame.statusText:SetJustifyH("LEFT")
 end
 
---- Creates the column headers, the scrolling list and the empty-list message.
+--- Creates a tab's page: a frame covering the window that holds the tab's column
+--- headers, scrolling list and empty-list message, hidden until the tab is selected.
 --- Uses Blizzard's ScrollBox with a linear view: only visible rows have frames, which
---- are reused as the list scrolls (initRow fills them in).
+--- are reused as the list scrolls (initRow fills them in). Each page has its own
+--- scroll box, so each tab keeps its own rows and scroll position. Also sets the tab's
+--- starting sort.
 ---@param frame Frame The window
-local function createList(frame)
-    frame.headers = {}
-    for _, column in ipairs(COLUMNS) do
-        frame.headers[#frame.headers + 1] = createHeader(frame, column)
+---@param tab table An entry from TABS (runtime fields are added to it)
+local function createPage(frame, tab)
+    local page = CreateFrame("Frame", nil, frame)
+    page:SetAllPoints(frame)
+    page:Hide()
+    tab.page = page
+    tab.sortKey = tab.defaultSortKey
+    tab.sortAscending = false
+
+    tab.headers = {}
+    for _, column in ipairs(tab.columns) do
+        tab.headers[#tab.headers + 1] = createHeader(page, tab, column)
     end
 
-    frame.scrollBox = CreateFrame("Frame", nil, frame, "WowScrollBoxList")
-    frame.scrollBox:SetPoint("TOPLEFT", frame, "TOPLEFT", PADDING, HEADER_OFFSET_Y - HEADER_HEIGHT)
-    frame.scrollBox:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -(PADDING + SCROLLBAR_GAP), PADDING)
+    tab.scrollBox = CreateFrame("Frame", nil, page, "WowScrollBoxList")
+    tab.scrollBox:SetPoint("TOPLEFT", page, "TOPLEFT", PADDING, HEADER_OFFSET_Y - HEADER_HEIGHT)
+    tab.scrollBox:SetPoint("BOTTOMRIGHT", page, "BOTTOMRIGHT", -(PADDING + SCROLLBAR_GAP), PADDING)
 
-    local scrollBar = CreateFrame("EventFrame", nil, frame, "MinimalScrollBar")
-    scrollBar:SetPoint("TOPLEFT", frame.scrollBox, "TOPRIGHT", SCROLLBAR_OFFSET_X, 0)
-    scrollBar:SetPoint("BOTTOMLEFT", frame.scrollBox, "BOTTOMRIGHT", SCROLLBAR_OFFSET_X, 0)
+    local scrollBar = CreateFrame("EventFrame", nil, page, "MinimalScrollBar")
+    scrollBar:SetPoint("TOPLEFT", tab.scrollBox, "TOPRIGHT", SCROLLBAR_OFFSET_X, 0)
+    scrollBar:SetPoint("BOTTOMLEFT", tab.scrollBox, "BOTTOMRIGHT", SCROLLBAR_OFFSET_X, 0)
 
     local view = CreateScrollBoxListLinearView()
     view:SetElementExtent(ROW_HEIGHT)
-    view:SetElementInitializer("Button", initRow)
-    ScrollUtil.InitScrollBoxListWithScrollBar(frame.scrollBox, scrollBar, view)
+    -- The initializer only gets (row, element), so this closure supplies the page's columns.
+    view:SetElementInitializer("Button", function(row, element)
+        initRow(row, element, tab.columns)
+    end)
+    ScrollUtil.InitScrollBoxListWithScrollBar(tab.scrollBox, scrollBar, view)
 
-    frame.emptyText = frame:CreateFontString(nil, "OVERLAY", "GameFontDisable")
-    frame.emptyText:SetPoint("CENTER", frame.scrollBox, "CENTER")
-    frame.emptyText:Hide()
+    tab.emptyTextFrame = page:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+    tab.emptyTextFrame:SetPoint("CENTER", tab.scrollBox, "CENTER")
+    tab.emptyTextFrame:Hide()
+end
+
+--- Shows one tab's page and hides the others, then fills it.
+--- Highlights the tab button (PanelTemplates_SetTab), saves the choice in
+--- ns.db.selectedTab so the window reopens on it, and refreshes the list, since the
+--- results or search may have changed while the page was hidden.
+---@param index number Position of the tab in TABS
+local function selectTab(index)
+    activeTab = TABS[index]
+    ns.db.selectedTab = activeTab.id
+    PanelTemplates_SetTab(window, index)
+    for _, tab in ipairs(TABS) do
+        tab.page:SetShown(tab == activeTab)
+    end
+    updateHeaders(activeTab)
+    refreshList()
+end
+
+--- Finds a tab's position in TABS by its id, for restoring the saved tab.
+--- Falls back to the first tab if the id is unknown (e.g. a tab removed in a later version).
+---@param id string|nil A tab id, e.g. ns.db.selectedTab
+---@return number index
+local function findTabIndex(id)
+    for index, tab in ipairs(TABS) do
+        if tab.id == id then
+            return index
+        end
+    end
+    return 1
+end
+
+--- Switches to the clicked tab with Blizzard's tab sound, through ns.SafeCall so errors
+--- are logged. The tab's position in TABS is stored as the button's ID (createTabs).
+---@param button Button The clicked tab button
+local function onTabClick(button)
+    PlaySound(SOUNDKIT.IG_CHARACTER_INFO_TAB)
+    ns.SafeCall(selectTab, button:GetID())
+end
+
+--- Creates one Blizzard-style tab button per entry in TABS along the window's bottom
+--- edge, left to right, and registers them with PanelTemplates so the selected one is
+--- drawn raised. The buttons are named WINDOW_NAME .. "Tab" .. index and also stored
+--- in frame.Tabs, since PanelTemplates looks tabs up either way.
+---@param frame Frame The window
+local function createTabs(frame)
+    frame.Tabs = {}
+    for index, tab in ipairs(TABS) do
+        local button = CreateFrame("Button", WINDOW_NAME .. "Tab" .. index, frame, TAB_TEMPLATE)
+        button:SetID(index)
+        button:SetText(tab.label)
+        if index == 1 then
+            button:SetPoint("TOPLEFT", frame, "BOTTOMLEFT", TAB_OFFSET_X, TAB_OFFSET_Y)
+        else
+            button:SetPoint("TOPLEFT", frame.Tabs[index - 1], "TOPRIGHT", TAB_GAP, 0)
+        end
+        button:SetScript("OnClick", onTabClick)
+        PanelTemplates_TabResize(button, TAB_TEXT_PADDING)
+        frame.Tabs[index] = button
+    end
+    PanelTemplates_SetNumTabs(frame, #TABS)
 end
 
 --- Saves the window's position after the player drags it.
@@ -456,12 +663,12 @@ local function onDragStop(frame)
 end
 
 --- Brings the window up to date when it opens, and starts the once-a-second status ticker.
---- Runs through ns.SafeCall (see getWindow), and so does each tick.
+--- Opens on the saved tab (selectTab also fills its list). Runs through ns.SafeCall
+--- (see getWindow), and so does each tick.
 ---@param frame Frame The window
 local function onWindowShow(frame)
     updateStatus()
-    updateHeaders()
-    refreshList()
+    selectTab(findTabIndex(ns.db.selectedTab))
     frame.ticker = C_Timer.NewTicker(STATUS_UPDATE_INTERVAL, function()
         ns.SafeCall(updateStatus)
     end)
@@ -505,7 +712,10 @@ local function getWindow()
     if not window then
         window = createWindowFrame()
         createToolbar(window)
-        createList(window)
+        for _, tab in ipairs(TABS) do
+            createPage(window, tab)
+        end
+        createTabs(window)
         window:SetScript("OnShow", function(frame)
             ns.SafeCall(onWindowShow, frame)
         end)
