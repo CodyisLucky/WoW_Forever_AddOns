@@ -8,6 +8,10 @@
     A variant is an item ID plus the name shown in the auction's item link, so
     "Axe of the Monkey" and "Axe of the Bear" are separate even though they share
     an item ID. Items that stack can't have a suffix, so their link isn't read.
+    The scan sometimes has no link yet for an auction (seen with random-suffix
+    gloves and bracers). Those auctions are set aside and their link is read again
+    after reading; one that never gets a link goes to Below Vendor under the plain
+    name and is left out of Undercuts, where mixing suffixes gives wrong gaps.
 
     A full scan (C_AuctionHouse.ReplicateItems) can be started by any addon, and
     the server allows one every 15 minutes, shared by all of them. Gathercraft
@@ -19,8 +23,10 @@
       reading  every auction is read in time-limited steps, one step per frame,
                while the Auction House is open (closing it loses the list)
       loading  reading is done and the results are saved, but some items weren't
-               in the item cache yet. Their auctions wait until the item data
-               arrives (or ITEM_LOAD_TIMEOUT passes), then join the results.
+               in the item cache yet, or some auctions had no link yet. Those
+               auctions wait until the item data arrives or the link can be read
+               (or ITEM_LOAD_TIMEOUT passes, or the Auction House closes), then
+               join the results.
 ]]
 
 local _, ns = ...
@@ -43,7 +49,8 @@ local SCAN_COOLDOWN = 15 * 60 -- seconds the server waits between full scans
 local DUPLICATE_EVENT_WINDOW = 10 * 60
 local READ_BUDGET_MS = 8 -- time spent reading per frame, so the game doesn't freeze
 local SCAN_ANSWER_TIMEOUT = 30 -- seconds to wait for the server after ns.StartScan
-local ITEM_LOAD_TIMEOUT = 60 -- seconds to wait for uncached items before giving up on them
+local ITEM_LOAD_TIMEOUT = 60 -- seconds to wait for uncached items and missing links before giving up
+local LINK_RETRY_INTERVAL = 1 -- seconds between reads of the links that were missing
 -- Version of the saved results format. Saved results in any other format are discarded
 -- by getRealmData. 1 (v0.1.0) summed every listing; 2 kept the lowest price per item ID;
 -- 3 keys rows by variant (item ID + suffix) and adds the undercut list.
@@ -52,8 +59,10 @@ local RESULTS_FORMAT = 3
 local LINK_NAME_PATTERN = "|h%[(.-)%]|h"
 -- Separates the item ID from the suffixed name in a variant key: "4567:Axe of the Monkey".
 local VARIANT_KEY_SEPARATOR = ":"
--- Values per held auction in scan.held[itemID]: count, buyout, link (or false).
+-- Values per held auction in scan.held[itemID]: count, buyout, scan index.
 local HELD_STRIDE = 3
+-- Values per auction in scan.missingLinks: scan index, item ID, count, buyout.
+local MISSING_LINK_STRIDE = 4
 
 ns.SCAN_STATES = {
     IDLE = "idle",
@@ -77,8 +86,11 @@ local ahOpen = false
 --   crateListings auctions of crates and fill items: crateListings[itemID] = { count, buyout, ... } (WaylaidCrates.lua)
 --   itemInfo      itemInfo[itemID] = { name, quality, vendorPrice, bulk } for items already looked up
 --   variants      variants[itemID][name] = variant (see getVariant)
---   held          held[itemID] = { count, buyout, link, count, buyout, link, ... } for items not cached yet
+--   held          held[itemID] = { count, buyout, index, count, buyout, index, ... } for items not cached yet
 --   heldCount     number of item IDs in held
+--   missingLinks  { index, itemID, count, buyout, ... } auctions of cached items whose link isn't readable yet
+--   linksMissing, linksRecovered  auctions ever put in missingLinks / later read with a link, for the log
+--   retryTicker   C_Timer ticker re-reading missingLinks while loading, nil otherwise
 --   readStartedMs, loadStartedMs  debugprofilestop() when reading / loading began, for the log
 --   bidOnly, unreadable           auctions skipped for having no buyout / failing to read, for the log
 --   emptyLinkNames                links with no name between the brackets, for the log
@@ -249,18 +261,100 @@ local function getVariant(scan, itemID, info, link)
     return variant
 end
 
---- Passes one auction of a cached item to both result builders (BelowVendor.lua and
---- Undercuts.lua), after working out its variant.
+--- Passes one auction of a cached item to the result builders, after working out its
+--- variant. Below Vendor (BelowVendor.lua) always gets it. Undercuts (Undercuts.lua)
+--- gets it unless its suffix is unknown, because then it would land in the plain-name
+--- row with other suffixes and the gap between them would be meaningless.
 ---@param scan table The active scan
 ---@param itemID number
 ---@param info table The item's details from getItemInfo
 ---@param count number Units in the auction
 ---@param buyout number Buyout for the whole auction, in copper
 ---@param link string|nil The auction's item link, if it was read
-local function addAuction(scan, itemID, info, count, buyout, link)
+---@param inUndercuts boolean Whether to add it to Undercuts
+local function addAuction(scan, itemID, info, count, buyout, link, inUndercuts)
     local variant = getVariant(scan, itemID, info, link)
     addVendorListing(scan.vendorRows, variant, count, buyout)
-    addUndercutListing(scan.undercuts, variant, count, buyout)
+    if inUndercuts then
+        addUndercutListing(scan.undercuts, variant, count, buyout)
+    end
+end
+
+--- Sets an auction aside because the scan has no link for it yet, so its suffix is unknown.
+--- Its link is read again after reading (retryMissingLinks).
+---@param scan table The active scan
+---@param index number 0-based scan index, for reading the link again
+---@param itemID number
+---@param count number
+---@param buyout number
+local function queueMissingLink(scan, index, itemID, count, buyout)
+    local pending = scan.missingLinks
+    pending[#pending + 1] = index
+    pending[#pending + 1] = itemID
+    pending[#pending + 1] = count
+    pending[#pending + 1] = buyout
+    scan.linksMissing = scan.linksMissing + 1
+end
+
+--- Adds one auction of a cached item, reading its link first when it can have a suffix.
+--- Bulk (stacking) items can't have one, so their link isn't read. Without the link
+--- API (see getReplicateItemLink) suffixes can't be told apart at all, so auctions go
+--- in under the plain name, Undercuts included. Otherwise an auction whose link
+--- can't be read yet is set aside (queueMissingLink) instead of being guessed.
+---@param scan table The active scan
+---@param index number 0-based scan index
+---@param itemID number
+---@param info table The item's details from getItemInfo
+---@param count number
+---@param buyout number
+local function addCachedAuction(scan, index, itemID, info, count, buyout)
+    if info.bulk or not getReplicateItemLink then
+        addAuction(scan, itemID, info, count, buyout, nil, true)
+        return
+    end
+    local link = readLink(index)
+    if link then
+        addAuction(scan, itemID, info, count, buyout, link, true)
+    else
+        queueMissingLink(scan, index, itemID, count, buyout)
+    end
+end
+
+--- Reads the link of every auction set aside by queueMissingLink again.
+--- Auctions that have a link now are added to the results; the rest stay set aside.
+--- Builds a new list rather than removing entries in place, which keeps the loop simple.
+---@param scan table The active scan
+---@return number recovered Auctions added by this pass
+local function retryMissingLinks(scan)
+    local pending, remaining, recovered = scan.missingLinks, {}, 0
+    for i = 1, #pending, MISSING_LINK_STRIDE do
+        local index, itemID, count, buyout = pending[i], pending[i + 1], pending[i + 2], pending[i + 3]
+        local link = readLink(index)
+        if link then
+            -- Only cached items are set aside, so their details are already in scan.itemInfo.
+            addAuction(scan, itemID, scan.itemInfo[itemID], count, buyout, link, true)
+            recovered = recovered + 1
+        else
+            for offset = 0, MISSING_LINK_STRIDE - 1 do
+                remaining[#remaining + 1] = pending[i + offset]
+            end
+        end
+    end
+    scan.missingLinks = remaining
+    scan.linksRecovered = scan.linksRecovered + recovered
+    return recovered
+end
+
+--- Adds the auctions that never got a link under the plain item name, Below Vendor only.
+--- Their price is still right for Below Vendor, which compares with the vendor price
+--- (the same for every suffix). Called once, when loading ends.
+---@param scan table The scan being finished
+local function addUnlinkedAuctions(scan)
+    local pending = scan.missingLinks
+    for i = 1, #pending, MISSING_LINK_STRIDE do
+        local itemID = pending[i + 1]
+        addAuction(scan, itemID, scan.itemInfo[itemID], pending[i + 2], pending[i + 3], nil, false)
+    end
 end
 
 --- Fills in a saved row's name, quality and bulk flag once its item data has loaded.
@@ -322,22 +416,40 @@ local function endScan(scan)
     ns.OnScanUpdated()
 end
 
---- Ends the loading phase: the scan is done, and any items that never loaded are dropped.
---- Called when the last held item resolves, or by the ITEM_LOAD_TIMEOUT timer.
---- Saves the results again so the undercut pick includes the items that loaded, logs
---- how long loading took and how many items never arrived, then ends the scan.
+--- Ends the loading phase: the scan is done, and anything still waiting is settled.
+--- Called when nothing is waiting any more, by the ITEM_LOAD_TIMEOUT timer, or when the
+--- Auction House closes (the scan list is gone, so links can't be read any more).
+--- Stops the link retries, adds auctions that never got a link (addUnlinkedAuctions),
+--- saves the results again so the undercut pick includes everything that arrived, logs
+--- what never arrived, then ends the scan. Held items that never loaded are dropped.
 ---@param scan table The scan being finished
 local function finishLoading(scan)
+    if scan.retryTicker then
+        scan.retryTicker:Cancel()
+        scan.retryTicker = nil
+    end
+    addUnlinkedAuctions(scan)
     saveResults(scan)
-    ns.Debug(("Item data loading finished after %.1f s; %d items never loaded and were skipped."):format(
-        (debugprofilestop() - scan.loadStartedMs) / 1000, scan.heldCount))
+    ns.Debug(("Loading finished after %.1f s: %d items never loaded and were skipped; %d auctions had no link, %d got one later, %d never did (Below Vendor only)."):format(
+        (debugprofilestop() - scan.loadStartedMs) / 1000, scan.heldCount,
+        scan.linksMissing, scan.linksRecovered, #scan.missingLinks / MISSING_LINK_STRIDE))
     endScan(scan)
 end
 
+--- Ends the loading phase if no item is held and no auction is waiting for its link.
+---@param scan table The scan in the loading state
+local function finishLoadingIfDone(scan)
+    if scan.heldCount == 0 and #scan.missingLinks == 0 then
+        finishLoading(scan)
+    end
+end
+
 --- Adds an item's held auctions to the results once its data has loaded, then forgets them.
---- Ignored if a newer scan has replaced this one. While loading, the window is told
---- to refresh, and the scan finishes when this was the last held item. During reading
---- the results aren't shown yet, so finishReading does that instead.
+--- Ignored if a newer scan has replaced this one. Each auction's link is read now, by
+--- its scan index (addCachedAuction), so an auction can still be set aside for its link.
+--- While loading, the window is told to refresh, and the scan finishes when nothing is
+--- waiting any more. During reading the results aren't shown yet, so finishReading
+--- does that instead.
 ---@param scan table The scan that held the auctions
 ---@param itemID number
 local function resolveHeldListings(scan, itemID)
@@ -351,30 +463,28 @@ local function resolveHeldListings(scan, itemID)
     local info = getItemInfo(scan, itemID)
     if info then
         for i = 1, #held, HELD_STRIDE do
-            -- A missing link is stored as false (nil would end the array); pass nil on.
-            addAuction(scan, itemID, info, held[i], held[i + 1], held[i + 2] or nil)
+            addCachedAuction(scan, held[i + 2], itemID, info, held[i], held[i + 1])
         end
     end
 
     if scan.state == STATES.LOADING then
         ns.OnScanUpdated()
-        if scan.heldCount == 0 then
-            finishLoading(scan)
-        end
+        finishLoadingIfDone(scan)
     end
 end
 
 --- Keeps an auction for an item that isn't in the item cache yet, so it can be added later.
---- The first auction held for an item also asks the game to load it, using Blizzard's
---- Item mixin, which calls back when the data arrives. The auction is stored before
---- the request, in case the callback runs straight away. The callback runs through
---- ns.SafeCall so an error in it is logged.
+--- Keeps the scan index rather than the link: the link is read once the item has loaded,
+--- when it's more likely to be there. The first auction held for an item also asks the
+--- game to load it, using Blizzard's Item mixin, which calls back when the data arrives.
+--- The auction is stored before the request, in case the callback runs straight away.
+--- The callback runs through ns.SafeCall so an error in it is logged.
 ---@param scan table The active scan
 ---@param itemID number
 ---@param count number
 ---@param buyout number
----@param link string|nil The auction's item link, kept so its suffix isn't lost
-local function holdListing(scan, itemID, count, buyout, link)
+---@param index number 0-based scan index, for reading the link later
+local function holdListing(scan, itemID, count, buyout, index)
     local held = scan.held[itemID]
     local isNew = not held
     if isNew then
@@ -384,7 +494,7 @@ local function holdListing(scan, itemID, count, buyout, link)
     end
     held[#held + 1] = count
     held[#held + 1] = buyout
-    held[#held + 1] = link or false
+    held[#held + 1] = index
 
     if isNew then
         Item:CreateFromItemID(itemID):ContinueOnItemLoad(function()
@@ -393,12 +503,11 @@ local function holdListing(scan, itemID, count, buyout, link)
     end
 end
 
---- Sorts one auction: cached items go to the results, uncached items are held.
---- Every auction is first offered to the crate builder (ns.AddCrateListing), which
---- only needs the item ID, so crate and fill-item auctions count even when the item
---- isn't cached. The link is only read when the item might have a suffix: when it
---- isn't known to be a bulk (stacking) item. Items already being held skip the cache
---- lookup, so only one load is requested per item.
+--- Sorts one auction: cached items go to the results (addCachedAuction), uncached items
+--- are held. Every auction is first offered to the crate builder (ns.AddCrateListing),
+--- which only needs the item ID, so crate and fill-item auctions count even when the
+--- item isn't cached. Items already being held skip the cache lookup, so only one
+--- load is requested per item.
 ---@param scan table The active scan
 ---@param index number 0-based auction index, for reading the link
 ---@param itemID number
@@ -407,15 +516,14 @@ end
 local function considerAuction(scan, index, itemID, count, buyout)
     addCrateListing(scan.crateListings, itemID, count, buyout)
     if scan.held[itemID] then
-        holdListing(scan, itemID, count, buyout, readLink(index))
+        holdListing(scan, itemID, count, buyout, index)
         return
     end
     local info = getItemInfo(scan, itemID)
-    local link = not (info and info.bulk) and readLink(index) or nil
     if info then
-        addAuction(scan, itemID, info, count, buyout, link)
+        addCachedAuction(scan, index, itemID, info, count, buyout)
     else
-        holdListing(scan, itemID, count, buyout, link)
+        holdListing(scan, itemID, count, buyout, index)
     end
 end
 
@@ -441,20 +549,45 @@ local function readAuction(index)
     return pickAuctionFields(pcall(C_AuctionHouse.GetReplicateItemInfo, index))
 end
 
---- Saves the results once every auction is read, then waits for held items if there are any.
---- Replaces this realm's saved results with the new scan (saveResults) and logs a summary
---- (time taken, skipped auctions, variants and items found). The scan stays active in the
---- loading state while items are held, and the window is told to refresh either way.
+--- Re-reads the missing links once per LINK_RETRY_INTERVAL while loading.
+--- Refreshes the window when an auction was added, and ends loading once nothing is
+--- waiting. Stops if a newer scan has replaced this one.
+---@param scan table The scan in the loading state
+local function onRetryTick(scan)
+    if activeScan ~= scan then
+        if scan.retryTicker then
+            scan.retryTicker:Cancel()
+            scan.retryTicker = nil
+        end
+        return
+    end
+    if retryMissingLinks(scan) > 0 then
+        ns.OnScanUpdated()
+    end
+    finishLoadingIfDone(scan)
+end
+
+--- Saves the results once every auction is read, then waits for what's still missing.
+--- First re-reads the links that were missing (some arrive while reading goes on), then
+--- replaces this realm's saved results with the new scan (saveResults) and logs a
+--- summary. If items are held or links are still missing, the scan moves to the loading
+--- state: a ticker re-reads the links (onRetryTick) and a timer ends loading after
+--- ITEM_LOAD_TIMEOUT. The window is told to refresh either way.
 ---@param scan table The scan that just finished reading
 local function finishReading(scan)
+    retryMissingLinks(scan)
     saveResults(scan)
-    ns.Debug(("Read %d auctions in %.1f s: %d bid-only skipped, %d unreadable, %d variants, %d below vendor, %d items waiting for item data, %d links without a name."):format(
+    ns.Debug(("Read %d auctions in %.1f s: %d bid-only skipped, %d unreadable, %d variants, %d below vendor, %d items waiting for item data, %d links without a name, %d auctions without a link (%d read on the second try)."):format(
         scan.total, (debugprofilestop() - scan.readStartedMs) / 1000, scan.bidOnly, scan.unreadable,
-        countKeys(scan.undercuts), countKeys(scan.vendorRows), scan.heldCount, scan.emptyLinkNames))
+        countKeys(scan.undercuts), countKeys(scan.vendorRows), scan.heldCount, scan.emptyLinkNames,
+        scan.linksMissing, scan.linksRecovered))
 
-    if scan.heldCount > 0 then
+    if scan.heldCount > 0 or #scan.missingLinks > 0 then
         scan.state = STATES.LOADING
         scan.loadStartedMs = debugprofilestop()
+        scan.retryTicker = C_Timer.NewTicker(LINK_RETRY_INTERVAL, function()
+            ns.SafeCall(onRetryTick, scan)
+        end)
         C_Timer.After(ITEM_LOAD_TIMEOUT, function()
             if activeScan == scan then
                 ns.SafeCall(finishLoading, scan)
@@ -520,6 +653,9 @@ local function startReading(total)
         bidOnly = 0,
         unreadable = 0,
         emptyLinkNames = 0,
+        missingLinks = {},
+        linksMissing = 0,
+        linksRecovered = 0,
     }
     activeScan = scan
     ns.Debug(("Reading full scan: %d auctions."):format(total))
@@ -575,8 +711,8 @@ end
 
 --- Remembers that the Auction House closed, and cancels a scan that is still being read.
 --- The rest of the scan list is gone once the Auction House closes, so a half-read scan
---- is dropped and the previous results stay. A scan in the loading state doesn't need
---- the Auction House any more and carries on. Logs the close with the number of
+--- is dropped and the previous results stay. A scan in the loading state is finished
+--- straight away (finishLoading), since what it waits for is read from that list. Logs the close with the number of
 --- full-scan events ignored during this visit.
 local function onAuctionHouseClosed()
     ahOpen = false
@@ -585,6 +721,9 @@ local function onAuctionHouseClosed()
         activeScan = nil
         ns.Print(L.SCAN_CANCELLED)
         ns.OnScanUpdated()
+    elseif activeScan then
+        -- Loading: links and held auctions are read by scan index, and the list is gone.
+        finishLoading(activeScan)
     end
 end
 
@@ -625,13 +764,13 @@ end
 --- Returns what the scanner is doing right now, for the window's status line.
 ---@return string state One of ns.SCAN_STATES
 ---@return number progress Fraction read (0-1) while reading, otherwise 0
----@return number loadingCount Items still loading while in the loading state, otherwise 0
+---@return number loadingCount Items still loading plus auctions still waiting for a link, while in the loading state, otherwise 0
 function ns.GetScanStatus()
     if activeScan then
         if activeScan.state == STATES.READING then
             return STATES.READING, activeScan.index / activeScan.total, 0
         end
-        return STATES.LOADING, 0, activeScan.heldCount
+        return STATES.LOADING, 0, activeScan.heldCount + #activeScan.missingLinks / MISSING_LINK_STRIDE
     end
     if ahOpen and isAwaitingAnswer(getRealmData()) then
         return STATES.WAITING, 0, 0

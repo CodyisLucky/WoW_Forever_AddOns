@@ -29,7 +29,10 @@ local WINDOW_TEMPLATE = "BasicFrameTemplateWithInset"
 -- Same layer as Blizzard's bags and Auction House frame (both MEDIUM), so with
 -- SetToplevel whichever was clicked last is drawn on top. HIGH covered the bags.
 local WINDOW_STRATA = "MEDIUM"
-local WINDOW_WIDTH = 680
+-- The list is WINDOW_WIDTH - 2 * PADDING - SCROLLBAR_GAP wide (652). The widest tabs,
+-- Below Vendor and Undercuts, need 644: their column widths plus a CELL_GAP between each.
+-- Cells past that edge are clipped, so widen this when adding a column.
+local WINDOW_WIDTH = 700
 local WINDOW_HEIGHT = 460
 local PADDING = 12
 local TITLE_OFFSET_Y = -5
@@ -71,6 +74,10 @@ local SHORT_BUNDLE_COLOR = { r = 0.5, g = 0.5, b = 0.5 } -- grey
 -- Sort value for a price that can't be worked out (shown as L.NO_VALUE). Bigger than
 -- any price, so those rows sort last when sorting low to high.
 local NO_PRICE = math.huge
+-- Sort value for a unit count that's missing (shown as L.NO_VALUE): Undercuts rows saved
+-- before 0.6.0 have no totalQuantity. Every real count is at least 2 (two auctions), so
+-- 0 never clashes with one, and those rows sort last when sorting high to low.
+local NO_COUNT = 0
 local SECONDS_PER_MINUTE = 60
 local SECONDS_PER_HOUR = 60 * 60
 local SECONDS_PER_DAY = 24 * 60 * 60
@@ -121,6 +128,17 @@ local function formatMoneyOrNone(copper)
     return formatMoney(copper)
 end
 
+--- Formats a unit count like formatQuantity, or L.NO_VALUE ("—") for NO_COUNT.
+--- Used by the Undercuts Listed column, which older saved rows don't have.
+---@param count number A unit count, or NO_COUNT
+---@return string
+local function formatQuantityOrNone(count)
+    if count == NO_COUNT then
+        return L.NO_VALUE
+    end
+    return formatQuantity(count)
+end
+
 --- Formats a fill bundle as its quantity and item name, e.g. "20 Light Leather".
 ---@param bundle table A bundle from a saved crate row
 ---@return string
@@ -141,10 +159,11 @@ local VENDOR_COLUMNS = {
 }
 
 local UNDERCUT_COLUMNS = {
-    { key = "name", label = L.COL_ITEM, width = 290, justify = "LEFT", ascendingFirst = true },
+    { key = "name", label = L.COL_ITEM, width = 250, justify = "LEFT", ascendingFirst = true },
     { key = "unitLowest", label = L.COL_LOWEST, width = 100, justify = "RIGHT", format = formatMoney },
     { key = "unitSecond", label = L.COL_SECOND, width = 100, justify = "RIGHT", format = formatMoney },
     { key = "difference", label = L.COL_DIFFERENCE, width = 100, justify = "RIGHT", format = formatMoney },
+    { key = "totalQuantity", label = L.COL_LISTED, width = 70, justify = "RIGHT", format = formatQuantityOrNone },
 }
 
 -- Level, Favor and Fill with are already plain values, so tostring is their format.
@@ -237,7 +256,8 @@ local function makeVendorElement(row)
 end
 
 --- Builds an Undercuts list element's columns from a saved row, using the same
---- ns.GetUndercutPrices that ranked the rows, so the numbers always agree.
+--- ns.GetUndercutPrices that ranked the rows, so the numbers always agree. Total units
+--- listed is copied from the row, or NO_COUNT for rows saved before it existed.
 ---@param row table A saved Undercuts row (always has a second auction)
 ---@return table element The tab-specific fields (buildElements adds the shared ones)
 local function makeUndercutElement(row)
@@ -246,6 +266,7 @@ local function makeUndercutElement(row)
         unitLowest = unitLowest,
         unitSecond = unitSecond,
         difference = difference,
+        totalQuantity = row.totalQuantity or NO_COUNT,
     }
 end
 

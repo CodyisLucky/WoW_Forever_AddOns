@@ -2,7 +2,8 @@
     Undercuts.lua
     Builds the "Undercuts" results: for each item variant, the cheapest and the
     second cheapest auction by unit price, then keeps the MAX_SAVED_UNDERCUTS
-    variants where the gap between the two is largest.
+    variants where the gap between the two is largest. Each variant also counts
+    every unit listed across all its auctions (totalQuantity).
 
     "Second cheapest" means the second auction, not the next higher price: three
     axes at 60s and one at 1g10s have a gap of 0, because the second auction is
@@ -20,8 +21,9 @@ local compareUnitPrice = ns.CompareUnitPrice
 
 local MAX_SAVED_UNDERCUTS = 200 -- variants kept after a scan, largest gap first
 
---- Adds one auction to its variant's cheapest-two record.
---- The first auction of a variant creates its entry. After that, an auction cheaper
+--- Adds one auction to its variant's cheapest-two record and its total units listed.
+--- The first auction of a variant creates its entry. After that, every auction adds
+--- its units to totalQuantity, and an auction cheaper
 --- per unit than the lowest becomes the lowest and pushes the old lowest down to
 --- second. Otherwise it becomes the second if there is none yet or it's cheaper than
 --- the current second. An auction priced the same as the lowest goes to second, which
@@ -41,11 +43,13 @@ function ns.AddUndercutListing(entries, variant, count, buyout)
             bulk = variant.bulk,
             lowestBuyout = buyout,  -- cheapest auction per unit: lowestBuyout / lowestCount
             lowestCount = count,
+            totalQuantity = count,  -- units listed across every auction of this variant
             -- secondBuyout, secondCount: second cheapest auction, set once there is one
         }
         return
     end
 
+    entry.totalQuantity = entry.totalQuantity + count
     if compareUnitPrice(buyout, count, entry.lowestBuyout, entry.lowestCount) < 0 then
         entry.secondBuyout, entry.secondCount = entry.lowestBuyout, entry.lowestCount
         entry.lowestBuyout, entry.lowestCount = buyout, count

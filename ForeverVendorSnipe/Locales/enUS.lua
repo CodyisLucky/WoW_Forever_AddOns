@@ -66,6 +66,7 @@ ns.L = {
     COL_LOWEST = "Lowest",
     COL_SECOND = "2nd lowest",
     COL_DIFFERENCE = "Difference",
+    COL_LISTED = "Listed",
     TAB_VENDOR = "Below Vendor",
     TAB_UNDERCUTS = "Undercuts",
     TAB_CRATES = "Waylaid Crates",

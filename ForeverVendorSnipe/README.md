@@ -5,7 +5,7 @@ Target: World of Warcraft: Forever (interface 16001). Not compatible with Retail
 Three lists from each full Auction House scan:
 
 - **Below Vendor:** items whose buyout is below what a vendor pays for them, ranked by the profit you'd make buying them and selling them to a vendor.
-- **Undercuts:** the 200 items whose cheapest auction is furthest below the second cheapest, per unit. For example, an axe listed at 60s3c with the next axe at 1g10s3c is a 50s gap.
+- **Undercuts:** the 200 items whose cheapest auction is furthest below the second cheapest, per unit, with how many units of each are listed in total. For example, an axe listed at 60s3c with the next axe at 1g10s3c is a 50s gap.
 - **Waylaid Crates:** every Waylaid Crate with its required level, the Merchant's Favor it gives when turned in, the cheapest crate on the AH, the cheapest bundle to fill it, and what filling it and buying and filling it cost per Favor.
 
 **Current status (0.5.0):** reads full Auction House scans (from Gathercraft, any other addon, or its own Scan button) and shows the three lists on three tabs of a movable window. List only: it doesn't buy anything.
@@ -14,9 +14,9 @@ Three lists from each full Auction House scan:
 
 1. Open the Auction House. The results window opens with it, showing the last saved scan.
 2. Gathercraft starts a full scan when the Auction House opens. This addon reads that same scan, so it never uses up the shared cooldown itself.
-3. Auctions are grouped by item **and suffix**: "Axe of the Monkey" and "Axe of the Bear" are separate rows, even though they're the same item underneath.
+3. Auctions are grouped by item **and suffix**: "Axe of the Monkey" and "Axe of the Bear" are separate rows, even though they're the same item underneath. The scan sometimes doesn't have an auction's item link (where the suffix comes from) straight away. Those auctions wait up to 60 seconds after reading for their link. One that never gets it is shown on Below Vendor under the plain item name and left out of Undercuts, where mixing suffixes would give a wrong difference.
 4. **Below Vendor:** every auction with a buyout is compared with the item's vendor price. When `vendor price × stack size` is more than the buyout, the auction counts. Each item gets one row with its lowest below-vendor price per unit, and how many units are listed at exactly that price.
-5. **Undercuts:** for each item, the cheapest and the second cheapest auction (by price per unit) are kept. The 200 items with the biggest gap between the two are saved. The second cheapest is the second *auction*, not the next higher price: if three axes are listed at 60s, the second cheapest is 60s and the gap is 0. Only a single cheap auction on its own counts.
+5. **Undercuts:** for each item, the cheapest and the second cheapest auction (by price per unit) are kept. Every unit listed is also added up per item. The 200 items with the biggest gap between the two are saved. The second cheapest is the second *auction*, not the next higher price: if three axes are listed at 60s, the second cheapest is 60s and the gap is 0. Only a single cheap auction on its own counts.
 6. **Waylaid Crates:** every auction of a Waylaid Crate or of an item that fills one is kept. A crate is filled with any one of the bundles in its tooltip (Apprentice Textiles: 40 Linen Cloth or 20 Light Leather). Each bundle's cost is what buying that many units from the cheapest listings costs, e.g. 5 bars at 8s plus 15 at 10s. The cheapest bundle is the crate's fill cost. Filled crates are turned in for Merchant's Favor and a little money, so the costs are shown per Favor: fill cost ÷ Favor, and (crate price + fill cost − turn-in money) ÷ Favor. The crate list and rewards are built into the addon (see `/vsnipe crates` and `CrateData.lua`).
 
 The server allows **one full scan every 15 minutes, shared by every addon**. If Gathercraft is disabled or its auto-scan is off, use the window's **Scan** button. It's greyed out with a countdown until 15 minutes have passed since the last scan this addon saw. It can't see Gathercraft's own timer, so the server may still refuse a click, and the window says so after 30 seconds.
@@ -47,6 +47,7 @@ Default sort: highest profit per unit first. Ties go to the lowest buyout.
 | Lowest | Cheapest auction's buyout per unit |
 | 2nd lowest | Second cheapest auction's buyout per unit |
 | Difference | 2nd lowest minus Lowest, per unit |
+| Listed | Units listed across all of the item's auctions. Shows "—" on results saved before 0.6.0 until the next scan |
 
 Default sort: biggest difference first. Ties go to the lowest price. Only the 200 biggest differences from the last scan are kept, and items with a difference of 0 aren't listed.
 
@@ -161,7 +162,7 @@ Builds the Undercuts rows. Like BelowVendor.lua, it only sees variants and aucti
 
 | Function | Scope | Purpose |
 |---|---|---|
-| `ns.AddUndercutListing(entries, variant, count, buyout)` | public | Keeps each variant's cheapest and second cheapest auction by unit price. An auction tied with the cheapest becomes the second (gap 0) |
+| `ns.AddUndercutListing(entries, variant, count, buyout)` | public | Keeps each variant's cheapest and second cheapest auction by unit price, and adds the auction's units to `totalQuantity`. An auction tied with the cheapest becomes the second (gap 0) |
 | `ns.GetUndercutPrices(entry)` | public | `unitLowest, unitSecond, difference` for an entry. Used for ranking here and for the window's columns |
 | `insertRanked(ranked, gaps, entry, gap)` | local | Inserts into a list sorted by gap, largest first, capped at 200 |
 | `ns.PickTopUndercuts(entries)` | public | The 200 entries with the largest gap above 0, as an array, largest first. Called when results are saved |
@@ -197,18 +198,24 @@ Reads full scans, groups auctions into variants, and feeds the three builders. I
 | `readLink(index)` | local | One auction's item link via `C_AuctionHouse.GetReplicateItemLink`, pcall-wrapped. nil if the API is missing |
 | `getLinkName(scan, link)` | local | The name between a link's brackets, with suffix. Falls back to `C_Item.GetItemInfo(link)` and counts empty names for the log |
 | `getVariant(scan, itemID, info, link)` | local | The auction's variant `{ key, itemID, name, link, quality, bulk, vendorPrice }`, cached per item and name |
-| `addAuction(scan, itemID, info, count, buyout, link)` | local | Works out the variant and passes the auction to `ns.AddVendorListing` and `ns.AddUndercutListing` |
+| `addAuction(scan, itemID, info, count, buyout, link, inUndercuts)` | local | Works out the variant and passes the auction to `ns.AddVendorListing`, and to `ns.AddUndercutListing` unless `inUndercuts` is false (suffix unknown) |
+| `queueMissingLink(scan, index, itemID, count, buyout)` | local | Sets aside an auction whose link can't be read yet, by scan index |
+| `addCachedAuction(scan, index, itemID, info, count, buyout)` | local | Adds an auction of a cached item: no link for bulk items (or without the link API), otherwise reads the link and adds it, or sets it aside if there's none yet |
+| `retryMissingLinks(scan)` | local | Reads the set-aside links again and adds the auctions that have one now. Returns how many |
+| `addUnlinkedAuctions(scan)` | local | When loading ends, adds the auctions that never got a link under the plain name, Below Vendor only |
 | `fillName(row)` | local | Fills a saved row's name (by link for suffixed rows), quality and bulk flag once its item data loads |
 | `fillMissingNames(rows)` | local | Safety net: requests data for rows without a name and logs how many there were. Used for the Below Vendor and Undercuts rows (crate rows take their names from `CrateData.lua`) |
 | `saveResults(scan)` | local | Saves the Below Vendor rows, the top-200 undercut pick, the crate rows (`ns.BuildCrateRows`), scan time and auction count |
 | `endScan(scan)` | local | Clears the active scan, fills missing names, refreshes the window |
-| `finishLoading(scan)` | local | Saves again (so the undercut pick includes loaded items), logs loading time, ends the scan |
-| `resolveHeldListings(scan, itemID)` | local | Adds an item's held auctions once its data arrives |
-| `holdListing(scan, itemID, count, buyout, link)` | local | Keeps an auction (with its link) for an uncached item and requests the item's data |
-| `considerAuction(scan, index, itemID, count, buyout)` | local | Offers the auction to `ns.AddCrateListing` (needs only the item ID), then reads the link unless the item is known to stack and routes to `addAuction` or `holdListing` |
+| `finishLoading(scan)` | local | Stops the link retries, adds unlinked auctions (`addUnlinkedAuctions`), saves again (so the undercut pick includes what arrived), logs what never arrived, ends the scan |
+| `finishLoadingIfDone(scan)` | local | Calls `finishLoading` once no item is held and no link is missing |
+| `resolveHeldListings(scan, itemID)` | local | Adds an item's held auctions through `addCachedAuction` once its data arrives |
+| `holdListing(scan, itemID, count, buyout, index)` | local | Keeps an auction (with its scan index, for the link) for an uncached item and requests the item's data |
+| `considerAuction(scan, index, itemID, count, buyout)` | local | Offers the auction to `ns.AddCrateListing` (needs only the item ID), then routes it to `addCachedAuction` or `holdListing` |
 | `pickAuctionFields(ok, ...)` | local | Picks itemID, count and buyout from `GetReplicateItemInfo`'s 18 return values |
 | `readAuction(index)` | local | Reads one auction, pcall-wrapped |
-| `finishReading(scan)` | local | Saves the results, logs a summary, then waits for held items if any |
+| `onRetryTick(scan)` | local | Every second while loading: `retryMissingLinks`, refresh the window if anything was added, finish if nothing is waiting |
+| `finishReading(scan)` | local | Retries missing links once, saves the results, logs a summary, then moves to loading (retry ticker plus 60 s timeout) if items are held or links are missing |
 | `readStep(scan)` | local | Reads auctions for up to 8 ms, counting bid-only and unreadable ones, then continues next frame |
 | `startReading(total)` | local | Creates the scan state and starts reading |
 | `onReplicateListUpdate()` | local | `REPLICATE_ITEM_LIST_UPDATE`: starts reading a scan from any addon, ignoring (and counting) repeat events with a cheap time check first |
@@ -218,7 +225,7 @@ Reads full scans, groups auctions into variants, and feeds the three builders. I
 | `ns.GetUndercutRows()` | public | Saved Undercuts rows for this realm (array, largest gap first) |
 | `ns.GetCrateRows()` | public | Saved Waylaid Crates rows for this realm (array, `ns.CRATES` order) |
 | `ns.GetScanInfo()` | public | `scannedAt, auctionCount` for the saved results. With the two above, replaces 0.3's `ns.GetResults` |
-| `ns.GetScanStatus()` | public | `state, progress, loadingCount` for the status line |
+| `ns.GetScanStatus()` | public | `state, progress, loadingCount` for the status line. `loadingCount` is held items plus auctions waiting for a link |
 | `ns.GetScanCooldown()` | public | Seconds until a scan should be allowed |
 | `ns.IsAuctionHouseOpen()` | public | Whether the AH window is open |
 | `reportIfUnanswered(realm, requestedAt)` | local | Says so in chat if a scan request got no answer within 30 s |
@@ -246,6 +253,7 @@ The results window. It's created on first show and reads from Scanner.lua throug
 | `formatMoney(copper)` | local | `GetMoneyString` after rounding to the nearest copper |
 | `formatQuantity(count)` | local | Thousands separators, for the Qty column |
 | `formatMoneyOrNone(copper)` | local | `formatMoney`, or "—" for a missing price (`NO_PRICE`). Waylaid Crates columns |
+| `formatQuantityOrNone(count)` | local | `formatQuantity`, or "—" for a missing count (`NO_COUNT`). Undercuts Listed column |
 | `formatBundle(bundle)` | local | `"20 Light Leather"` |
 | `computeColumnOffsets(columns)` | local | Gives each column its x position, shared by headers and rows. Run once per tab's column set |
 | `compareByName(a, b)` | local | Shared last tie-breakers: name, then item ID |
@@ -253,7 +261,7 @@ The results window. It's created on first show and reads from Scanner.lua throug
 | `compareUndercutDefault(a, b)` | local | Difference high to low, then lowest price low to high, then `compareByName` |
 | `compareCrateDefault(a, b)` | local | Total / Favor low to high ("—" last), then level low to high, then `compareByName` |
 | `makeVendorElement(row)` | local | Qty, unit buyout, vendor price and profit for a Below Vendor row |
-| `makeUndercutElement(row)` | local | Lowest, 2nd lowest and difference for an Undercuts row, via `ns.GetUndercutPrices` |
+| `makeUndercutElement(row)` | local | Lowest, 2nd lowest and difference for an Undercuts row, via `ns.GetUndercutPrices`, plus total units listed (`NO_COUNT` on rows saved before 0.6.0) |
 | `makeCrateElement(row)` | local | Level, Favor, price, cheapest bundle, Fill / Favor and Total / Favor for a crate row, via `ns.GetCrateCosts`. Missing prices become `NO_PRICE` |
 | `getCrateSearchText(row)` | local | Crate name plus bundle item names, lowercase, for the search box |
 | `addCrateTooltipLines(tooltip, element)` | local | Adds the turn-in reward and each bundle's whole cost (cheapest green, short ones grey) below the crate's tooltip |
@@ -316,6 +324,7 @@ ForeverVendorSnipeDB.realms["Realm Name"] = {
             bulk = false,
             lowestBuyout = 6003,  lowestCount = 1,   -- cheapest auction (60s 3c each)
             secondBuyout = 11003, secondCount = 1,   -- second cheapest (1g 10s 3c each)
+            totalQuantity = 3,                       -- units listed across all its auctions
         },
     },
     crates = {                   -- Waylaid Crates rows, array in ns.CRATES order (one per crate)
@@ -340,7 +349,7 @@ ForeverVendorSnipeDB.realms["Realm Name"] = {
 }
 ```
 
-The example values are illustrative. Unit prices, profit and difference aren't saved. The window works them out from the buyout and count pairs. `resultsFormat` is the format version, and results in an older format are discarded on load (0.4.0 bumped it to 3). 0.5.0 added `crates` without a bump: results saved by 0.4.x keep their other lists and get an empty crate list until the next scan.
+The example values are illustrative. Unit prices, profit and difference aren't saved. The window works them out from the buyout and count pairs. `resultsFormat` is the format version, and results in an older format are discarded on load (0.4.0 bumped it to 3). 0.5.0 added `crates` without a bump: results saved by 0.4.x keep their other lists and get an empty crate list until the next scan. 0.6.0 added `totalQuantity` to undercut rows, also without a bump: older rows show "—" in Listed until the next scan.
 
 ### Events
 - `ADDON_LOADED`: initialize SavedVariables (unregistered after first use)
@@ -358,15 +367,16 @@ The example values are illustrative. Unit prices, profit and difference aren't s
 - **Listen instead of scan.** The 15-minute full-scan cooldown is shared by every addon, and Gathercraft already scans when the AH opens. `REPLICATE_ITEM_LIST_UPDATE` fires no matter which addon asked, so reading that scan costs nothing. The Scan button is only a fallback.
 - **Repeat events are ignored by time.** The game fires `REPLICATE_ITEM_LIST_UPDATE` many times for one scan. Gathercraft's code shows the full list can be read on the first one. A real new scan can't arrive within 15 minutes, so events within 10 minutes of the last scan seen are treated as repeats. The timestamp is saved, so a `/reload` mid-scan doesn't read the same scan twice. The log showed about 96,000 repeats per scan (roughly one per 2.5 auctions), so repeats are dropped by comparing `time()` with a local `ignoreEventsUntil` before any saved data is read.
 - **Reading in timed steps.** A scan can hold ~300,000 auctions (per Gathercraft's notes). Reading stops after 8 ms each frame and continues next frame, so the game doesn't freeze. 0.3 read ~240,000 auctions in about 11.5 s.
-- **Must read while the AH is open.** The scan list is gone once the AH closes, so closing mid-read cancels the scan and keeps the previous results. Item-data loading carries on after closing, since it doesn't need the AH.
+- **Must read while the AH is open.** The scan list is gone once the AH closes, so closing mid-read cancels the scan and keeps the previous results. Closing while loading finishes the scan straight away: held auctions and missing links are read from the scan list by index, so nothing more can arrive.
 - **One reader, three builders.** Scanner.lua reads each auction once and hands it to BelowVendor.lua, Undercuts.lua and WaylaidCrates.lua. The builders only see the auction and the table they fill, so none of them knows about scans, saving or the window. The crate builder gets `(itemID, count, buyout)` in `considerAuction`, before the item-cache check, since the crate list already names every item it needs. Its auctions are never held for item data.
 - **Variants by link name.** Random-suffix items ("of the Monkey") share an item ID. Forever's links follow the modern layout, and Gathercraft's notes describe suffixes as *bonuses*, so the suffix may not sit in the classic suffix field. Grouping by the name between the link's brackets works whichever way the suffix is encoded, and it groups exactly what the player sees. Plain items keep the item ID as their key. Suffixed ones use `"itemID:name"` and keep the link for the tooltip. If the brackets are ever empty, the name comes from `C_Item.GetItemInfo(link)`, and the log counts how often that happened (expected 0).
+- **Auctions without a link wait, then skip Undercuts.** `GetReplicateItemLink` sometimes returns nothing for an auction at first (0.6.0: 5 of 7 Opulent Gloves, every one a different suffix). Falling back to the plain name merged all those suffixes into one Undercuts row with a wrong gap. Now such an auction is set aside by scan index and its link is read again after reading, then once a second until the 60 second loading timeout. One that never gets a link still counts for Below Vendor (the vendor price is the same for every suffix) but is left out of Undercuts. The log line at the end of loading says how many were missing, recovered and never arrived. Without the link API at all, auctions still go in under the plain name, Undercuts included, since otherwise no non-stacking item would be listed.
 - **Links are only read when needed.** Items that stack can't have a suffix, so their link isn't read. Only non-stacking items (and items not cached yet, whose stack size is unknown) cost the extra `GetReplicateItemLink` call. If that API is missing on the client, suffixed items fall back to grouping by item ID and the log says so.
 - **Vendor price per item, not per suffix.** The vendor price comes from the base item (`C_Item.GetItemInfo(itemID)`), cached once per item per scan. Suffixed variants of an item share it.
 - **"Second cheapest" is the second auction.** Three axes at 60s give a gap of 0, so the list only shows a single cheap auction standing alone below the rest. Auctions are compared per unit with `ns.CompareUnitPrice`, so stacks of different sizes compare fairly.
 - **Only the top 200 undercuts are saved.** Every variant on the AH (tens of thousands) is tracked during the scan, then `ns.PickTopUndercuts` keeps the 200 biggest gaps above 0 in a single pass. That keeps SavedVariables small. The pick runs when reading finishes and again when held items finish loading.
 - **No "last sold" column.** The modern `C_AuctionHouse` API has no sale history for other players' auctions (no last sold price or date). The only sold data is for the player's own auctions (`GetOwnedAuctionInfo`, the "auction sold" notification). Showing an earlier scan's lowest listing or your own last sale was considered and left out for now.
-- **Uncached items are held, not dropped.** The vendor price and name come from the item cache. Auctions for uncached items are held as `(count, buyout, link)`. The item data is requested through Blizzard's `Item` mixin, and the auctions join both lists when it arrives. Results are saved as soon as reading finishes, and held items join them as they load, for up to 60 seconds.
+- **Uncached items are held, not dropped.** The vendor price and name come from the item cache. Auctions for uncached items are held as `(count, buyout, scan index)`, and the link is read once the item has loaded. The item data is requested through Blizzard's `Item` mixin, and the auctions join both lists when it arrives. Results are saved as soon as reading finishes, and held items join them as they load, for up to 60 seconds.
 - **Results are saved per realm**, because each realm has its own Auction House. Only the grouped rows are saved, not raw auctions.
 - **Lowest price per item, compared exactly.** Each row keeps one auction's `(buyout, count)` at the lowest unit price, plus the units at that price. Unit prices are compared by cross-multiplying, so stack prices that work out to fractions of a copper compare exactly. Rounding only happens for display.
 - **Names are read with the vendor price.** In 0.1.0 the name was looked up later, when the item's row was created. With 200,000+ auctions read in between, the game could drop the item from its cache, so some rows had no name. Now both come from one `C_Item.GetItemInfo` call. `fillMissingNames` is a safety net that logs a count, which should stay 0.
@@ -380,7 +390,8 @@ The example values are illustrative. Unit prices, profit and difference aren't s
 - **Bundle costs are saved, the choice isn't.** Each saved crate row has every bundle's cost (or shortfall), because the auctions behind them aren't saved. The cheapest bundle and the costs per Favor are worked out by `ns.GetCrateCosts` when the window draws, like the other tabs' derived values.
 - **Rewards are read from the data, not saved.** Favor and money are fixed per crate, so `ns.GetCrateCosts` looks them up in `ns.CRATES` by item ID. Correcting a value (e.g. once the Artisan rewards are confirmed) shows straight away, without a new scan.
 - **Turn-in money lowers only the total.** Fill / Favor is the cost of the bundle alone. Total / Favor is what a Favor really costs when buying the crate too, so it subtracts the money the turn-in pays back.
-- **"—" sorts as infinity.** Missing prices are stored on list elements as `math.huge` (`NO_PRICE`), so the shared `compareElements` can sort them without nil checks and they land last in a low-to-high sort. `formatMoneyOrNone` shows them as "—".
+- **Window width fits the widest tab.** Row cells are clipped at the list's edge, which is `WINDOW_WIDTH - 2 * PADDING - SCROLLBAR_GAP` (652 px). Below Vendor and Undercuts both need 644 (column widths plus gaps), so a new column means widening the window or narrowing another column.
+- **"—" sorts as infinity.** Missing prices are stored on list elements as `math.huge` (`NO_PRICE`), so the shared `compareElements` can sort them without nil checks and they land last in a low-to-high sort. `formatMoneyOrNone` shows them as "—". A missing Undercuts unit count works the same way with `NO_COUNT` (0, since a real count is at least 2), so those rows land last in the column's default high-to-low sort.
 - **Tab hooks instead of special cases.** The crates tab needed search over its fill items, extra tooltip lines and a low-to-high default sort. These are optional `TABS` fields (`getSearchText`, `addTooltipLines`, `defaultSortAscending`), so `buildElements`, `onRowEnter` and `createPage` stay generic.
 - **Crate list from a dump, not live detection.** Waylaid Crates are filled with any one of several bundles listed in their tooltip ("40 Linen Cloth or 20 Light Leather"). Wowhead's Forever pages load their data with JavaScript, so the list couldn't be collected from there. `/vsnipe crates` logs what the AH search shows, and `CrateData.lua` is a hardcoded, reviewable table built from that log. Reading tooltips on every scan would break silently if the wording changed, and crates with no listing would disappear. The dump reads the AH's search results because the player can search for crates directly, so no full scan is needed. Item names can't be turned into item IDs here (`C_Item.GetItemInfoInstant` only resolves names of items that have been in the bags), so the bundle item IDs are looked up separately.
 - **Gathercraft is a reference, not a dependency.** Its scan code (GPL-3) was read to confirm which APIs work on Forever. No code was copied, and the addon has no dependency on Gathercraft.
